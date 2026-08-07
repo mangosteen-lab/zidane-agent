@@ -27,16 +27,50 @@ curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/zidane-agent/main/sc
 ```
 
 Get the token from the console: **Settings → Agent registration tokens → Create**. It is
-shown once. Windows has `install.ps1` (`irm ... | iex`), and containers have
-`install-container.sh`.
+shown once. Windows has `install.ps1` (`irm ... | iex`).
+
+### Container
+
+```bash
+docker run -d --name zidane-agent --restart unless-stopped \
+  -e ZIDANE_BACKEND_WSS_URL=wss://zidane.example.com:17001/ws/agent \
+  -e ZIDANE_BACKEND_API_KEY=zdn_... \
+  -e ZIDANE_AGENT_LABELS="os=linux,template=UBUNTU_2404" \
+  ghcr.io/mangosteen-lab/zidane-agent:latest
+```
+
+`ubuntu:24.04` with a general build toolchain — Python 3.12, Node 22, JDK 21, Maven,
+Gradle 8.10, git, build-essential (~1.3GB). One image on purpose: the workflows this fleet
+runs are mixed-language, and a step that lands on an agent missing its toolchain fails at
+run time rather than at placement. Splitting per language means labelling the images
+accurately and keeping selectors in step with reality — worth doing when the size hurts,
+not before.
+
+Configuration is entirely by environment; the image ships **no** config.ini, so a token
+can never be baked into a layer. `ZIDANE_BACKEND_WSS_URL` and `ZIDANE_BACKEND_API_KEY` are
+required, everything else has a default. The entrypoint renders the config on every start,
+which means the environment always wins — a backend `SET_CONFIG` push (capacity, labels)
+applies at run time but is overwritten at the next restart, so set only what you mean to
+pin.
+
+**It upgrades on restart.** The entrypoint pulls the latest published release, verifies its
+sha256, installs it beside the baked one and flips `current` — the same versioned layout as
+a machine install, under the same `/opt/mangosteen/zidane-agent`. So `docker restart` moves
+the agent; `docker pull` moves the toolchain. Failure to reach GitHub is **not** fatal: an
+air-gapped or rate-limited container starts on the version baked into the image rather than
+crash-looping. `ZIDANE_UPGRADE_ON_START=0` pins it.
+
+The container runs as `zidane` (uid 1001), not root — the agent refuses to run as root, and
+that applies here too. Tasks run in per-task directories under
+`/opt/mangosteen/zidane-workspace`, which is also the container's working directory.
 
 Installs land in a versioned tree, which is what makes an upgrade reversible:
 
 ```
-/opt/zidane/zidane-agent/versions/0.1.0/    previous, kept
-/opt/zidane/zidane-agent/versions/0.2.0/    new
-/opt/zidane/zidane-agent/current -> versions/0.2.0
-/opt/zidane/zidane-agent/conf/config.ini    never touched by an upgrade
+/opt/mangosteen/zidane-agent/versions/0.1.0/    previous, kept
+/opt/mangosteen/zidane-agent/versions/0.2.0/    new
+/opt/mangosteen/zidane-agent/current -> versions/0.2.0
+/opt/mangosteen/zidane-agent/conf/config.ini    never touched by an upgrade
 ```
 
 The symlink flip is atomic (`os.replace`), so a crash mid-upgrade cannot leave `current`

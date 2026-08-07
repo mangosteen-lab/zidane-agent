@@ -9,14 +9,14 @@
 # the current one and flips the symlink, so this doubles as the upgrade path.
 #
 # Installs into a versioned tree so an upgrade can be rolled back:
-#   /opt/zidane/zidane-agent/versions/<version>/
-#   /opt/zidane/zidane-agent/current -> versions/<version>
+#   /opt/mangosteen/zidane-agent/versions/<version>/
+#   /opt/mangosteen/zidane-agent/current -> versions/<version>
 #
 # Runs as a dedicated unprivileged user. The agent refuses to run as root, which is
 # deliberate: scripts arriving from a central service should not execute unrestricted.
 set -euo pipefail
 
-INSTALL_ROOT="${ZIDANE_INSTALL_ROOT:-/opt/zidane/zidane-agent}"
+INSTALL_ROOT="${ZIDANE_INSTALL_ROOT:-/opt/mangosteen/zidane-agent}"
 SERVICE_USER="${ZIDANE_USER:-zidane}"
 WSS_URL="${ZIDANE_BACKEND_WSS_URL:-}"
 API_KEY="${ZIDANE_BACKEND_API_KEY:-}"
@@ -83,8 +83,13 @@ if [[ -z "$ARTIFACT" ]]; then
   fi
 fi
 
-# Fall back to the version in the artifact name, then to a timestamp, so the versioned
-# install tree never collides with a previous install.
+# Work out what to call this version: the checkout's own pyproject, then the artifact
+# filename, then a timestamp so the tree never collides with a previous install.
+# Getting this right matters beyond tidiness — upgrade.sh compares the directory name
+# against the latest release to decide whether there is anything to do.
+if [[ -z "$VERSION" && -n "$LOCAL_SOURCE" ]]; then
+  VERSION=$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$LOCAL_SOURCE/pyproject.toml" | head -1)
+fi
 if [[ -z "$VERSION" ]]; then
   VERSION=$(basename "${ARTIFACT:-}" .tar.gz | sed -n 's/^zidane-agent-//p')
   [[ -n "$VERSION" ]] || VERSION="0.0.0+$(date +%Y%m%d%H%M%S)"

@@ -8,9 +8,9 @@
 # Installs the new version *beside* the current one and flips the `current` symlink, so a
 # rollback is a symlink away and never a re-download:
 #
-#   /opt/zidane/zidane-agent/versions/0.2.0/   <- previous, kept
-#   /opt/zidane/zidane-agent/versions/0.3.0/   <- new
-#   /opt/zidane/zidane-agent/current -> versions/0.3.0
+#   /opt/mangosteen/zidane-agent/versions/0.2.0/   <- previous, kept
+#   /opt/mangosteen/zidane-agent/versions/0.3.0/   <- new
+#   /opt/mangosteen/zidane-agent/current -> versions/0.3.0
 #
 # This is the manual path. An agent with auto_upgrade=true does the same thing on its own
 # when the backend advertises a newer release — see app/updater.py. Use this when
@@ -19,12 +19,15 @@
 # The existing conf/config.ini is never touched.
 set -euo pipefail
 
-INSTALL_ROOT="${ZIDANE_INSTALL_ROOT:-/opt/zidane/zidane-agent}"
+INSTALL_ROOT="${ZIDANE_INSTALL_ROOT:-/opt/mangosteen/zidane-agent}"
 SERVICE_USER="${ZIDANE_USER:-zidane}"
 REPO="${ZIDANE_AGENT_REPO:-mangosteen-lab/zidane-agent}"
 VERSION="${ZIDANE_VERSION:-}"
 ARTIFACT="${ZIDANE_ARTIFACT_URL:-}"
 ROLLBACK=0
+# The container entrypoint execs the agent itself the moment this returns, so telling it
+# to "restart the agent yourself" is noise at best and misleading at worst.
+NO_RESTART="${ZIDANE_UPGRADE_NO_RESTART:-0}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -34,6 +37,7 @@ while [[ $# -gt 0 ]]; do
     --repo) REPO="$2"; shift 2 ;;
     --user) SERVICE_USER="$2"; shift 2 ;;
     --rollback) ROLLBACK=1; shift ;;
+    --no-restart) NO_RESTART=1; shift ;;
     -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
@@ -42,13 +46,18 @@ done
 die() { echo "error: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
 
-[[ $EUID -eq 0 ]] || die "run this with sudo"
 [[ -d "$INSTALL_ROOT" ]] || die "no installation at $INSTALL_ROOT — run install.sh first"
+# Writability, not uid 0: on a host /opt needs root, but in the container the agent user
+# owns its own tree and upgrades itself at start-up without a root shell in the image.
+[[ -w "$INSTALL_ROOT" ]] || die "cannot write $INSTALL_ROOT — run this with sudo"
 
 CURRENT_VERSION=""
 [[ -L "$INSTALL_ROOT/current" ]] && CURRENT_VERSION=$(basename "$(readlink "$INSTALL_ROOT/current")")
 
 restart_service() {
+  if [[ "$NO_RESTART" == "1" ]]; then
+    return 0
+  fi
   if command -v systemctl >/dev/null && \
      systemctl list-unit-files 2>/dev/null | grep -q '^zidane-agent\.service'; then
     info "restarting zidane-agent"
@@ -123,7 +132,11 @@ python3 -m venv "$VERSION_DIR/.venv"
 "$VERSION_DIR/.venv/bin/pip" install --quiet --upgrade pip
 "$VERSION_DIR/.venv/bin/pip" install --quiet "$VERSION_DIR"
 
-id -u "$SERVICE_USER" >/dev/null 2>&1 && chown -R "$SERVICE_USER" "$VERSION_DIR"
+# Non-fatal: in the container the agent user already owns the tree and cannot
+# chown, and there is nothing to fix up.
+if [[ $EUID -eq 0 ]] && id -u "$SERVICE_USER" >/dev/null 2>&1; then
+  chown -R "$SERVICE_USER" "$VERSION_DIR" || true
+fi
 
 # Atomic flip, so a crash mid-upgrade never leaves `current` dangling.
 ln -sfn "$VERSION_DIR" "$INSTALL_ROOT/current.new"
@@ -131,4 +144,4 @@ mv -Tf "$INSTALL_ROOT/current.new" "$INSTALL_ROOT/current"
 info "current -> $VERSION (was ${CURRENT_VERSION:-none})"
 
 restart_service
-echo "Roll back with: sudo bash upgrade.sh --rollback"
+[[ "$NO_RESTART" == "1" ]] || echo "Roll back with: sudo bash upgrade.sh --rollback"

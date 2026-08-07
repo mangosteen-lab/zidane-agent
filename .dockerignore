@@ -1,0 +1,17 @@
+# The build copies the checkout in to install from it; keep host artefacts out, both to
+# keep the image small and so a developer's local state never ships inside it.
+.git
+.github
+.venv
+dist
+state
+work
+logs
+conf/config.ini
+.env
+*.egg-info
+__pycache__
+**/__pycache__
+.pytest_cache
+.ruff_cache
+tests

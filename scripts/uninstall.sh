@@ -11,7 +11,7 @@
 # Env overrides mirror the flags: ZIDANE_INSTALL_ROOT, ZIDANE_USER, PURGE=1.
 set -euo pipefail
 
-INSTALL_ROOT="${ZIDANE_INSTALL_ROOT:-/opt/zidane/zidane-agent}"
+INSTALL_ROOT="${ZIDANE_INSTALL_ROOT:-/opt/mangosteen/zidane-agent}"
 SERVICE_USER="${ZIDANE_USER:-zidane}"
 PURGE="${PURGE:-0}"
 KEEP_USER=0
