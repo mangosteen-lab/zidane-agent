@@ -29,6 +29,10 @@ curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/zidane-agent/main/sc
 Get the token from the console: **Settings → Agent registration tokens → Create**. It is
 shown once. Windows has `install.ps1` (`irm ... | iex`).
 
+Use `wss://` only when something terminates TLS in front of the backend; a backend started
+with `make run` serves plain HTTP and needs `ws://`. The mismatch shows up as
+`[SSL: WRONG_VERSION_NUMBER]`, which the agent now annotates with the fix.
+
 ### Container
 
 ```bash

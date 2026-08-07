@@ -27,6 +27,26 @@ logger = logging.getLogger("zidane.client")
 PROTOCOL_VERSION = 1
 AGENT_VERSION = "0.0.2"
 
+
+def _connection_hint(exc: Exception, url: str) -> str:
+    """Turn the two connection failures people actually hit into an instruction.
+
+    A misconfigured scheme surfaces as an opaque OpenSSL or handshake error, and the
+    agent retries forever without ever saying what is wrong. It knows both halves — the
+    URL it dialled and what came back — so it can just say it.
+    """
+    text = str(exc)
+    if "WRONG_VERSION_NUMBER" in text or "record layer failure" in text:
+        # TLS handshake against a plaintext port.
+        return (f"\n  hint: {url} uses wss:// but the server is not serving TLS on that "
+                f"port. Use ws:// instead, or put a TLS terminator in front of the "
+                f"backend.")
+    if "http" in text.lower() and "handshake" in text.lower() and url.startswith("ws://"):
+        # The reverse: plaintext against a TLS port.
+        return (f"\n  hint: {url} uses ws:// but the server answered with TLS. "
+                f"Use wss://.")
+    return ""
+
 # Log flow control: batch small writes, and stop sending once too many chunks are
 # unacked so one chatty task cannot starve the socket.
 FLUSH_BYTES = 8192
@@ -122,8 +142,8 @@ class AgentClient:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - reconnect is the normal path
-                logger.warning("connection failed (%s); retrying in %.1fs",
-                               exc, delay)
+                logger.warning("connection failed (%s); retrying in %.1fs%s",
+                               exc, delay, _connection_hint(exc, self.config.wss_url))
             if self._stop.is_set():
                 break
             # Jittered backoff so a fleet reconnecting after a backend deploy does not
