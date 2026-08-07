@@ -40,7 +40,10 @@ mkdir -p "$HOST_DIR"/{state,logs,workspace}
 
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 docker pull "$IMAGE"
-docker run -d --name "$NAME" --restart unless-stopped \
+# --hostname as well as --name: the backend reuses an agent record when hostname and
+# name both match, so a recreated container keeps its identity, history and labels
+# instead of appearing as a second agent.
+docker run -d --name "$NAME" --hostname "$NAME" --restart unless-stopped \
   -e ZIDANE_BACKEND_WSS_URL="$WSS_URL" \
   -e ZIDANE_BACKEND_API_KEY="$API_KEY" \
   -e ZIDANE_AGENT_NAME="$NAME" \

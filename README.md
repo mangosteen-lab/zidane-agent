@@ -50,6 +50,20 @@ run time rather than at placement. Splitting per language means labelling the im
 accurately and keeping selectors in step with reality — worth doing when the size hurts,
 not before.
 
+**Naming.** `docker run --name` names the *container*, not the agent. Pass the name — and
+the matching hostname — or the agent registers as the random container id:
+
+```bash
+docker run -d --name build-01 --hostname build-01 \
+  -e ZIDANE_AGENT_NAME=build-01 ...
+```
+
+`--hostname` is not cosmetic: the backend reuses an agent record only when hostname **and**
+name match, so a container recreated without it registers as a *new* agent and leaves the
+old one behind as a ghost. `install-container.sh` sets both. Bind-mounting `state/` achieves
+the same thing by a different route — the session token in it re-registers the same
+`agent_id` — and is what you want anyway so in-flight results survive a restart.
+
 Configuration is entirely by environment; the image ships **no** config.ini, so a token
 can never be baked into a layer. `ZIDANE_BACKEND_WSS_URL` and `ZIDANE_BACKEND_API_KEY` are
 required, everything else has a default. The entrypoint renders the config on every start,
