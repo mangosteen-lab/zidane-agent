@@ -25,7 +25,7 @@ from app.updater import Updater, UpgradeError, UpgradeSpec
 logger = logging.getLogger("zidane.client")
 
 PROTOCOL_VERSION = 1
-AGENT_VERSION = "0.3.0"
+AGENT_VERSION = "0.0.2"
 
 # Log flow control: batch small writes, and stop sending once too many chunks are
 # unacked so one chatty task cannot starve the socket.

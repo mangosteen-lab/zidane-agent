@@ -1,6 +1,6 @@
 [project]
 name = "zidane-agent"
-version = "0.3.0"
+version = "0.0.2"
 description = "Zidane worker agent"
 requires-python = ">=3.11"
 dependencies = [
