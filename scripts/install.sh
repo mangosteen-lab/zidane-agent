@@ -65,7 +65,9 @@ PY_MINOR=$(python3 -c 'import sys; print(sys.version_info[1])')
 # this script is run from inside a checkout — that checkout.
 LOCAL_SOURCE=""
 if [[ -z "$ARTIFACT" ]]; then
-  SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd || true)"
+  # :- matters: piped through `curl | bash` there is no BASH_SOURCE, and `set -u` turns
+  # the lookup into an error message in the middle of an otherwise clean install.
+  SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." 2>/dev/null && pwd || true)"
   if [[ -n "$SOURCE_DIR" && -f "$SOURCE_DIR/pyproject.toml" && -d "$SOURCE_DIR/app" ]]; then
     LOCAL_SOURCE="$SOURCE_DIR"
   else
