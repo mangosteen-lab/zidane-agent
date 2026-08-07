@@ -1,0 +1,28 @@
+[project]
+name = "zidane-agent"
+version = "0.1.0"
+description = "Zidane worker agent"
+requires-python = ">=3.11"
+dependencies = [
+    "websockets>=13.0",
+    "psutil>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.8"]
+
+[project.scripts]
+zidane-agent = "app.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
