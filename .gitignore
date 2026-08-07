@@ -11,3 +11,4 @@ task_logs_test/
 state/
 work/
 logs/
+dist/

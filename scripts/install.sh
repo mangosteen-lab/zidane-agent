@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # Zidane agent installer (Linux / macOS).
 #
-#   curl -fsSL https://<backend>/install.sh | sudo bash -s -- --url wss://host:17001/ws/agent --token zdn_...
+#   curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/zidane-agent/main/scripts/install.sh \
+#     | sudo bash -s -- --url wss://host:17001/ws/agent --token zdn_...
+#
+# With no --artifact, it downloads the latest published release from GitHub and verifies
+# it against the release's SHA256SUMS. Re-running it installs a newer version alongside
+# the current one and flips the symlink, so this doubles as the upgrade path.
 #
 # Installs into a versioned tree so an upgrade can be rolled back:
 #   /opt/zidane/zidane-agent/versions/<version>/
@@ -19,7 +24,8 @@ AGENT_NAME="${ZIDANE_AGENT_NAME:-$(hostname)}"
 CAPACITY="${ZIDANE_AGENT_CAPACITY:-4}"
 LABELS="${ZIDANE_AGENT_LABELS:-os=linux}"
 ARTIFACT="${ZIDANE_ARTIFACT_URL:-}"
-VERSION="${ZIDANE_VERSION:-0.1.0}"
+VERSION="${ZIDANE_VERSION:-}"
+REPO="${ZIDANE_AGENT_REPO:-mangosteen-lab/zidane-agent}"
 NO_SERVICE=0
 
 while [[ $# -gt 0 ]]; do
@@ -32,6 +38,7 @@ while [[ $# -gt 0 ]]; do
     --artifact) ARTIFACT="$2"; shift 2 ;;
     --version) VERSION="$2"; shift 2 ;;
     --install-root) INSTALL_ROOT="$2"; shift 2 ;;
+    --repo) REPO="$2"; shift 2 ;;
     --user) SERVICE_USER="$2"; shift 2 ;;
     --no-service) NO_SERVICE=1; shift ;;
     -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
@@ -54,22 +61,60 @@ command -v python3 >/dev/null || die "python3 is required"
 PY_MINOR=$(python3 -c 'import sys; print(sys.version_info[1])')
 [[ "$PY_MINOR" -ge 11 ]] || die "python 3.11+ is required (found 3.$PY_MINOR)"
 
+# Resolve what to install: an explicit artifact, the latest GitHub release, or — when
+# this script is run from inside a checkout — that checkout.
+LOCAL_SOURCE=""
+if [[ -z "$ARTIFACT" ]]; then
+  SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd || true)"
+  if [[ -n "$SOURCE_DIR" && -f "$SOURCE_DIR/pyproject.toml" && -d "$SOURCE_DIR/app" ]]; then
+    LOCAL_SOURCE="$SOURCE_DIR"
+  else
+    info "finding the latest release of $REPO"
+    RELEASE_JSON=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest") \
+      || die "could not reach the GitHub API; pass --artifact to install from a mirror"
+    ARTIFACT=$(printf '%s' "$RELEASE_JSON" \
+      | grep -o '"browser_download_url": *"[^"]*\.tar\.gz"' | head -1 \
+      | sed 's/.*"\(https[^"]*\)"/\1/')
+    [[ -n "$ARTIFACT" ]] || die "no .tar.gz asset in the latest release of $REPO"
+    [[ -n "$VERSION" ]] || VERSION=$(printf '%s' "$RELEASE_JSON" \
+      | grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/.*"v\{0,1\}\([^"]*\)"/\1/')
+  fi
+fi
+
+# Fall back to the version in the artifact name, then to a timestamp, so the versioned
+# install tree never collides with a previous install.
+if [[ -z "$VERSION" ]]; then
+  VERSION=$(basename "${ARTIFACT:-}" .tar.gz | sed -n 's/^zidane-agent-//p')
+  [[ -n "$VERSION" ]] || VERSION="0.0.0+$(date +%Y%m%d%H%M%S)"
+fi
+
 info "installing to $INSTALL_ROOT (version $VERSION)"
 VERSION_DIR="$INSTALL_ROOT/versions/$VERSION"
 mkdir -p "$VERSION_DIR" "$INSTALL_ROOT/state" "$INSTALL_ROOT/work" \
          "$INSTALL_ROOT/logs" "$INSTALL_ROOT/conf"
 
-if [[ -n "$ARTIFACT" ]]; then
-  info "downloading $ARTIFACT"
-  TMP=$(mktemp)
-  curl -fsSL "$ARTIFACT" -o "$TMP"
-  tar -xzf "$TMP" -C "$VERSION_DIR" --strip-components=0
-  rm -f "$TMP"
+if [[ -n "$LOCAL_SOURCE" ]]; then
+  info "installing from $LOCAL_SOURCE"
+  cp -r "$LOCAL_SOURCE/app" "$LOCAL_SOURCE/pyproject.toml" "$VERSION_DIR/"
 else
-  # No artifact: install from the current directory (a checkout or CI build).
-  SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-  info "installing from $SOURCE_DIR"
-  cp -r "$SOURCE_DIR/app" "$SOURCE_DIR/pyproject.toml" "$VERSION_DIR/"
+  info "downloading $ARTIFACT"
+  TMPDIR_DL=$(mktemp -d); trap 'rm -rf "$TMPDIR_DL"' EXIT
+  NAME=$(basename "$ARTIFACT")
+  curl -fsSL "$ARTIFACT" -o "$TMPDIR_DL/$NAME"
+  # Verify against the release's SHA256SUMS. A tampered artifact is the one failure this
+  # installer can actually detect, so a mismatch aborts rather than warns.
+  if curl -fsSL "$(dirname "$ARTIFACT")/SHA256SUMS" -o "$TMPDIR_DL/SHA256SUMS" 2>/dev/null; then
+    if ( cd "$TMPDIR_DL" && grep " $NAME\$" SHA256SUMS | sha256sum -c - >/dev/null 2>&1 ); then
+      info "checksum OK"
+    else
+      die "checksum mismatch for $NAME — refusing to install"
+    fi
+  else
+    echo "warning: no SHA256SUMS published for this release; skipping verification" >&2
+  fi
+  # Flat archive: app/ and pyproject.toml sit at the top level, matching what
+  # app/updater.py expects when it unpacks an upgrade.
+  tar -xzf "$TMPDIR_DL/$NAME" -C "$VERSION_DIR"
 fi
 
 info "creating the virtualenv"

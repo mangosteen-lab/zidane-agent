@@ -8,7 +8,74 @@ rules.
 Protocol contract: `../zidane-backend/docs/design/02-agent-protocol.md`. Any change lands
 here and in `zidane-backend/app/ws/agent_ws.py` in the same commit.
 
-## Quick start
+## Install on a machine
+
+The repo is public, so these run unauthenticated anywhere:
+
+```bash
+# install (or upgrade in place) — downloads the latest release and verifies its sha256
+curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/zidane-agent/main/scripts/install.sh \
+  | sudo bash -s -- --url wss://<backend>:17001/ws/agent --token <YOUR_TOKEN>
+
+# upgrade to the latest release, or to a specific one
+curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/zidane-agent/main/scripts/upgrade.sh | sudo bash
+sudo bash upgrade.sh --version 0.3.0
+sudo bash upgrade.sh --rollback
+
+# uninstall — keeps conf/ and logs/ unless you pass --purge
+curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/zidane-agent/main/scripts/uninstall.sh | sudo bash
+```
+
+Get the token from the console: **Settings → Agent registration tokens → Create**. It is
+shown once. Windows has `install.ps1` (`irm ... | iex`), and containers have
+`install-container.sh`.
+
+Installs land in a versioned tree, which is what makes an upgrade reversible:
+
+```
+/opt/zidane/zidane-agent/versions/0.1.0/    previous, kept
+/opt/zidane/zidane-agent/versions/0.2.0/    new
+/opt/zidane/zidane-agent/current -> versions/0.2.0
+/opt/zidane/zidane-agent/conf/config.ini    never touched by an upgrade
+```
+
+The symlink flip is atomic (`os.replace`), so a crash mid-upgrade cannot leave `current`
+dangling. `--rollback` re-points it at the previous version without downloading anything.
+
+An agent with `auto_upgrade = true` does the same thing on its own when the backend
+advertises a newer release (`app/updater.py`); `upgrade.sh` is for when auto-upgrade is
+off, or to move one machine ahead of the fleet.
+
+## Releasing
+
+```bash
+make release VERSION=0.2.0     # bump, commit, tag, build, publish, print the backend config
+```
+
+`scripts/release.sh` bumps the version in **both** places it lives — `pyproject.toml` and
+`AGENT_VERSION` in `app/client.py` — then tags, builds the tarball, and publishes it to
+GitHub Releases with a `SHA256SUMS` asset. Pushing the tag also triggers
+`.github/workflows/release.yml`, which does the same build and pushes the container image
+to GHCR.
+
+Two things it guards, both of which produce a release that looks fine and breaks on the
+machine that installs it:
+
+- **The two version sites must agree.** The agent reports `app/client.py`'s value, and the
+  backend compares it against `ZIDANE_AGENT_RELEASE_VERSION` to decide whether to offer an
+  upgrade. If they drift, the fleet upgrades in a loop, forever chasing a version it never
+  claims to reach. `tests/test_version.py` checks this in `make check` too.
+- **The tarball is built from `HEAD`.** An uncommitted bump would ship the old code under
+  the new filename, so the script verifies the built archive really carries the version.
+
+The tarball is deliberately **flat** — `app/`, `pyproject.toml` at the top level, no
+directory prefix — because both `app/updater.py` and `install.sh` unpack it without
+stripping components.
+
+After publishing, set the three values it prints on the backend and restart it; that is
+what turns on one-click self-upgrade for the fleet.
+
+## Quick start (from a checkout)
 
 ```bash
 uv venv --python 3.12 .venv
