@@ -31,6 +31,13 @@ See `conf/config.example.ini`. The essentials:
 | `agent.labels` | `key=value` pairs. A step lands here only if its selector is satisfied |
 | `backend.wss_url` | e.g. `wss://zidane.example.com:17001/ws/agent` (the backend's default port) |
 | `backend.api_key` | Registration token; swapped for a rotating session token after first connect |
+| `logging.file` | Agent log, relative to the config file (default `logs/agent.log`) |
+| `logging.level` | Default `INFO` |
+| `logging.max_mb` | Rotate past this size (default 50) |
+| `logging.file_count` | Files kept, live one included (default 5) → a 250MB ceiling |
+
+The agent logs to stdout **and** to that rotating file. Task output is separate: it
+streams to the backend and is not mixed into the agent log.
 
 `[backend]` is **not** remotely writable. A `SET_CONFIG` push from the backend can change
 capacity, labels and logging, but cannot repoint the agent at a different server.

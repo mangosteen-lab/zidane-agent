@@ -36,6 +36,9 @@ class AgentConfig:
 
     log_file: str = "logs/agent.log"
     log_level: str = "INFO"
+    log_max_mb: int = 50
+    # Total files kept, the live one included: 5 x 50MB caps the log at 250MB.
+    log_file_count: int = 5
 
     # Root of the versioned install tree (see app/updater.py). Defaults to the parent
     # of the package so a checkout still works without an installer.
@@ -122,6 +125,13 @@ def load_config(path: str | Path) -> AgentConfig:
         candidate = Path(value or default)
         return candidate if candidate.is_absolute() else base / candidate
 
+    def get_int(section: str, option: str, default: int) -> int:
+        # A typo in a logging size must not stop the agent from starting.
+        try:
+            return int(get(section, option, str(default)) or default)
+        except ValueError:
+            return default
+
     config = AgentConfig(
         path=path,
         name=get("agent", "name") or socket.gethostname(),
@@ -136,6 +146,8 @@ def load_config(path: str | Path) -> AgentConfig:
         api_key=get("backend", "api_key"),
         log_file=get("logging", "file", "logs/agent.log"),
         log_level=get("logging", "level", "INFO"),
+        log_max_mb=get_int("logging", "max_mb", 50),
+        log_file_count=get_int("logging", "file_count", 5),
     )
     config.state_dir.mkdir(parents=True, exist_ok=True)
     config.workdir_root.mkdir(parents=True, exist_ok=True)

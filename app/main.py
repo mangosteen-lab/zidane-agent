@@ -17,14 +17,18 @@ logger = logging.getLogger("zidane.main")
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "conf" / "config.ini"
 
 
-def configure_logging(log_file: str, level: str, base: Path) -> None:
+def configure_logging(log_file: str, level: str, base: Path, *, max_mb: int = 50,
+                      file_count: int = 5) -> None:
+    """`file_count` counts the live file too, so the log costs at most
+    `max_mb * file_count` on disk."""
     path = Path(log_file)
     if not path.is_absolute():
         path = base / path
     path.parent.mkdir(parents=True, exist_ok=True)
     handlers: list[logging.Handler] = [
-        logging.handlers.RotatingFileHandler(path, maxBytes=10 * 1024 * 1024,
-                                             backupCount=5, encoding="utf-8"),
+        logging.handlers.RotatingFileHandler(path, maxBytes=max(1, max_mb) * 1024 * 1024,
+                                             backupCount=max(0, file_count - 1),
+                                             encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ]
     formatter = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
@@ -49,7 +53,8 @@ def check_privileges(allow_root: bool) -> None:
 
 async def _run(config_path: Path) -> None:
     config = load_config(config_path)
-    configure_logging(config.log_file, config.log_level, config_path.parent)
+    configure_logging(config.log_file, config.log_level, config_path.parent,
+                      max_mb=config.log_max_mb, file_count=config.log_file_count)
     logger.info("zidane-agent %s starting (name=%s capacity=%d labels=%s)",
                 AGENT_VERSION, config.name, config.capacity, config.labels)
 
