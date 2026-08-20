@@ -12,5 +12,6 @@ task_logs_test/
 state/
 work/
 logs/
+_data/
 dist/
 local.sh

@@ -4,10 +4,12 @@ import { dirname, relative, resolve } from "node:path";
 import { applyConfigValues } from "./config.mjs";
 
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$/;
+const LLM_APIS = new Set(["openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai"]);
+const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const SAFE_KEY = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
 const MAX_VALUE_BYTES = 1_000_000;
 
-/** Agent-owned CRUD store for Pi skills, configuration maps, and secrets. */
+/** Agent-owned CRUD store for Pi skills, config maps, secrets, and LLM profiles. */
 export class AgentDataStore {
   #pending = Promise.resolve();
 
@@ -15,6 +17,8 @@ export class AgentDataStore {
     this.local = local;
     this.configDirectory = resolve(local.config, "agent-config-maps");
     this.secretMetadata = resolve(local.config, "agent-secrets.json");
+    this.profileDirectory = resolve(local.config, "llm-profiles");
+    this.defaultProfileFile = resolve(local.config, "default-llm-profile.json");
   }
 
   handle(operation, input = {}) {
@@ -41,6 +45,11 @@ export class AgentDataStore {
     if (operation === "secret.update") return { item: await this.#updateSecret(input) };
     if (operation === "secret.delete") return { deleted: await this.#deleteSecret(input.secret_id) };
     if (operation === "secret.import") return { items: await this.#importSecrets(input.items) };
+    if (operation === "llm.list") return { items: await this.#listProfiles() };
+    if (operation === "llm.create") return { item: await this.#createProfile(input) };
+    if (operation === "llm.update") return { item: await this.#updateProfile(input) };
+    if (operation === "llm.delete") return { deleted: await this.#deleteProfile(input.profile_id) };
+    if (operation === "llm.select") return { item: await this.#selectProfile(input.profile_id) };
     if (operation === "account.refresh") return this.#refreshAccountResources(input);
     throw new Error(`unsupported agent data operation: ${operation}`);
   }
@@ -518,6 +527,145 @@ export class AgentDataStore {
     return { updated, removed };
   }
 
+
+  // ------------------------------------------------------------ LLM profiles
+  //
+  // The agent owns these outright: the control plane relays CRUD and keeps no copy,
+  // so a profile survives the server losing its database. A profile names one of the
+  // agent's own secrets rather than carrying a key, so no credential crosses the relay.
+
+  #profilePath(profileId) {
+    const target = resolve(this.profileDirectory, `${profileId}.json`);
+    if (dirname(target) !== this.profileDirectory) throw new Error("profile path escapes agent store");
+    return target;
+  }
+
+  /** The selected profile's id. A pre-relay agent stored the whole profile here. */
+  async #defaultProfileId() {
+    try {
+      const stored = JSON.parse(await readFile(this.defaultProfileFile, "utf8"));
+      return String(stored.profile_id ?? "");
+    } catch { return ""; }
+  }
+
+  async #loadProfiles() {
+    await mkdir(this.profileDirectory, { recursive: true });
+    const items = [];
+    for (const entry of await readdir(this.profileDirectory, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+      try {
+        const profile = JSON.parse(await readFile(resolve(this.profileDirectory, entry.name), "utf8"));
+        if (SAFE_ID.test(String(profile.profile_id ?? ""))) items.push(profile);
+      } catch { /* a half-written or hand-edited file is not fatal */ }
+    }
+    return items.sort((left, right) => String(left.name).localeCompare(String(right.name)));
+  }
+
+  async #listProfiles() {
+    const defaultId = await this.#defaultProfileId();
+    return (await this.#loadProfiles()).map((profile) => publicProfile(profile, defaultId));
+  }
+
+  /** Validate a write and resolve which agent secret key it will read at run time. */
+  async #cleanProfile(input, profileId) {
+    const name = String(input.name ?? "").trim();
+    if (!name || name.length > 120) throw new Error("profile name must contain 1 to 120 characters");
+    const existing = await this.#loadProfiles();
+    if (existing.some((item) => item.name === name && item.profile_id !== profileId)) {
+      throw new Error("an LLM profile with this name already exists");
+    }
+    const provider = String(input.provider ?? "");
+    if (!/^[a-z0-9][a-z0-9._-]{0,79}$/.test(provider)) throw new Error("invalid LLM provider");
+    const model = String(input.model ?? "").trim();
+    if (!model || model.length > 240) throw new Error("invalid LLM model");
+    const baseUrl = input.base_url ? String(input.base_url) : null;
+    const api = input.api ? String(input.api) : null;
+    if (Boolean(baseUrl) !== Boolean(api)) throw new Error("base_url and api must be set together");
+    if (api && !LLM_APIS.has(api)) throw new Error(`unsupported LLM API: ${api}`);
+    if (baseUrl && !/^https?:\/\/[^\s]+$/.test(baseUrl)) throw new Error("base_url must be an http(s) URL");
+    const thinkingLevel = String(input.thinking_level ?? "medium");
+    if (!THINKING_LEVELS.has(thinkingLevel)) throw new Error(`unsupported thinking level: ${thinkingLevel}`);
+    const tools = Array.isArray(input.tools) ? input.tools.slice(0, 32).map((tool) => String(tool)) : [];
+
+    let secretName = null;
+    let secretKey = null;
+    if (input.secret_name) {
+      secretName = validSecretName(input.secret_name);
+      const secret = (await this.#loadSecrets()).find((item) => item.name === secretName);
+      if (!secret) throw new Error(`this agent has no secret named ${secretName}`);
+      if (input.secret_key) {
+        secretKey = String(input.secret_key);
+        if (!secret.keys.includes(secretKey)) throw new Error(`secret ${secretName} has no key named ${secretKey}`);
+      } else if (secret.keys.length === 1) {
+        secretKey = secret.keys[0];
+      } else {
+        throw new Error(`secret ${secretName} holds several keys; choose the one to use`);
+      }
+    } else if (input.secret_key) {
+      throw new Error("choose a secret before a key");
+    }
+    return { name, provider, model, secret_name: secretName, secret_key: secretKey, base_url: baseUrl, api, thinking_level: thinkingLevel, tools };
+  }
+
+  /** A custom endpoint has to reach Pi's own model store to be selectable. */
+  async #registerCustomModel(profile) {
+    if (!profile.base_url || !profile.api) return;
+    const modelsPath = resolve(this.local.config, "models.json");
+    let models;
+    try { models = JSON.parse(await readFile(modelsPath, "utf8")); } catch { models = { providers: {} }; }
+    models.providers ??= {};
+    const configured = models.providers[profile.provider] ?? {};
+    const entries = Array.isArray(configured.models) ? configured.models : [];
+    if (!entries.some((entry) => entry.id === profile.model)) entries.push({ id: profile.model });
+    models.providers[profile.provider] = { ...configured, baseUrl: profile.base_url, api: profile.api, models: entries };
+    await atomicJson(modelsPath, models, 0o600);
+  }
+
+  async #writeProfile(profile) {
+    await mkdir(this.profileDirectory, { recursive: true });
+    await atomicJson(this.#profilePath(profile.profile_id), profile, 0o600);
+    await this.#registerCustomModel(profile);
+  }
+
+  async #createProfile(input) {
+    const profileId = crypto.randomUUID();
+    const clean = await this.#cleanProfile(input, profileId);
+    const timestamp = Date.now();
+    const profile = { profile_id: profileId, ...clean, created_at: timestamp, updated_at: timestamp };
+    await this.#writeProfile(profile);
+    // The first profile becomes the selected one; nothing else could be.
+    if (input.set_default || !(await this.#defaultProfileId())) return this.#selectProfile(profileId);
+    return publicProfile(profile, await this.#defaultProfileId());
+  }
+
+  async #updateProfile(input) {
+    const profileId = validId(input.profile_id, "LLM profile");
+    const current = (await this.#loadProfiles()).find((item) => item.profile_id === profileId);
+    if (!current) throw new Error("LLM profile not found");
+    const clean = await this.#cleanProfile(input, profileId);
+    const profile = { ...current, ...clean, updated_at: Date.now() };
+    await this.#writeProfile(profile);
+    if (input.set_default) return this.#selectProfile(profileId);
+    return publicProfile(profile, await this.#defaultProfileId());
+  }
+
+  async #deleteProfile(profileIdValue) {
+    const profileId = validId(profileIdValue, "LLM profile");
+    if (!(await this.#loadProfiles()).some((item) => item.profile_id === profileId)) return false;
+    await rm(this.#profilePath(profileId), { force: true });
+    // Deleting the selected profile leaves the agent with none, rather than silently
+    // promoting one it was never told to use.
+    if ((await this.#defaultProfileId()) === profileId) await rm(this.defaultProfileFile, { force: true });
+    return true;
+  }
+
+  async #selectProfile(profileIdValue) {
+    const profileId = validId(profileIdValue, "LLM profile");
+    const profile = (await this.#loadProfiles()).find((item) => item.profile_id === profileId);
+    if (!profile) throw new Error("LLM profile not found");
+    await atomicJson(this.defaultProfileFile, { profile_id: profileId }, 0o600);
+    return publicProfile(profile, profileId);
+  }
 }
 
 async function discoverSkills(root) {
@@ -667,6 +815,25 @@ function publicConfig(item) {
 function publicConfigSummary(item) {
   const { values: _values, ...summary } = publicConfig(item);
   return { ...summary, keys: Object.keys(item.values).sort(), entry_count: Object.keys(item.values).length };
+}
+
+/** Never carries a credential: a profile only ever names the secret to read. */
+function publicProfile(profile, defaultId) {
+  return {
+    profile_id: profile.profile_id,
+    name: profile.name,
+    provider: profile.provider,
+    model: profile.model,
+    secret_name: profile.secret_name ?? null,
+    secret_key: profile.secret_key ?? null,
+    base_url: profile.base_url ?? null,
+    api: profile.api ?? null,
+    thinking_level: profile.thinking_level ?? "medium",
+    tools: profile.tools ?? [],
+    is_default: profile.profile_id === defaultId,
+    created_at: profile.created_at,
+    updated_at: profile.updated_at,
+  };
 }
 
 function publicSecret(item) {

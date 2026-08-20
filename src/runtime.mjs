@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
-import { readSecret } from "./config.mjs";
+import { readAgentSecret, resolveLlmProfile } from "./config.mjs";
 import { contextTools } from "./context-tools.mjs";
 
 export class PiRuntime {
@@ -37,14 +37,13 @@ export class PiRuntime {
     const conversation = safeName(delivery.conversation_id ?? delivery.delivery_id);
     const workspace = resolve(this.local.workspaces, conversation);
     await mkdir(workspace, { recursive: true });
-    let profile = delivery.profile ?? {};
-    if (!profile.provider) {
-      try { profile = JSON.parse(await readFile(resolve(this.local.config, "default-llm-profile.json"), "utf8")); }
-      catch { profile = {}; }
-    }
+    // The control plane only names a profile; the agent owns every profile's contents.
+    let profile = {};
+    try { profile = await resolveLlmProfile(this.local, delivery.profile_id); }
+    catch { profile = {}; }
     const runtime = await ModelRuntime.create({ authPath: resolve(this.local.secrets, "pi-auth.json"), modelsPath: resolve(this.local.config, "models.json") });
     if (profile.provider && profile.secret_name) {
-      await runtime.setRuntimeApiKey(profile.provider, await readSecret(this.local, profile.secret_name));
+      await runtime.setRuntimeApiKey(profile.provider, await readAgentSecret(this.local, profile.secret_name, profile.secret_key));
     }
     const soul = await readFile(this.local.soul, "utf8");
     const loader = new DefaultResourceLoader({

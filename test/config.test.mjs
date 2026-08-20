@@ -3,7 +3,8 @@ import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { test } from "node:test";
-import { applyAgentInfo, applyLlmProfile, applyState, initialise, readSessionToken, writeSessionToken } from "../src/config.mjs";
+import { applyAgentInfo, applyState, initialise, readAgentSecret, readSessionToken, resolveLlmProfile, writeSessionToken } from "../src/config.mjs";
+import { AgentDataStore } from "../src/agent-data.mjs";
 
 test("LLM profiles and rotating sessions persist without embedding credentials", async () => {
   const root = await mkdtemp(resolve(tmpdir(), "zidane-config-test-"));
@@ -24,24 +25,51 @@ test("LLM profiles and rotating sessions persist without embedding credentials",
     assert.equal(await readSessionToken(local), "rotating-session");
     assert.equal((await stat(local.token)).mode & 0o777, 0o600);
 
-    const stored = await applyLlmProfile(local, {
-      profile_id: "profile-1",
+    // LLM profiles are agent-owned: created locally, and naming an agent secret
+    // rather than carrying a credential of their own.
+    const store = new AgentDataStore(local);
+    await store.handle("secret.create", { name: "LOCAL_MODEL", values: { api_key: "model-secret" } });
+    const stored = (await store.handle("llm.create", {
       name: "Local model",
       provider: "local-openai",
       model: "coder-model",
-      credential: "model-secret",
+      secret_name: "LOCAL_MODEL",
       base_url: "http://127.0.0.1:11434/v1",
       api: "openai-completions",
       thinking_level: "high",
-      set_default: true,
-    });
-    assert.equal(stored.secret_name, "llm-profile-profile-1");
-    assert.equal(await readFile(resolve(local.secrets, stored.secret_name), "utf8"), "model-secret");
-    const profileFile = await readFile(resolve(local.config, "default-llm-profile.json"), "utf8");
+    })).item;
+    // A single-key secret does not have to name its key.
+    assert.equal(stored.secret_key, "api_key");
+    // The first profile is selected automatically; nothing else could be.
+    assert.equal(stored.is_default, true);
+    assert.equal((await store.handle("llm.list")).items.length, 1);
+
+    const profileFile = await readFile(resolve(local.config, "llm-profiles", `${stored.profile_id}.json`), "utf8");
+    const pointerFile = await readFile(resolve(local.config, "default-llm-profile.json"), "utf8");
     const modelsFile = await readFile(resolve(local.config, "models.json"), "utf8");
     assert.doesNotMatch(profileFile, /model-secret/);
+    assert.doesNotMatch(pointerFile, /model-secret/);
     assert.doesNotMatch(modelsFile, /model-secret/);
     assert.equal(JSON.parse(modelsFile).providers["local-openai"].models[0].id, "coder-model");
+
+    // What the runtime resolves for a prompt: the profile by id, the value by name.
+    const resolved = await resolveLlmProfile(local, "");
+    assert.equal(resolved.provider, "local-openai");
+    assert.equal(resolved.model, "coder-model");
+    assert.equal(await readAgentSecret(local, resolved.secret_name, resolved.secret_key), "model-secret");
+    assert.deepEqual(await resolveLlmProfile(local, "no-such-profile-id").catch(() => "rejected"), "rejected");
+
+    await assert.rejects(
+      store.handle("llm.create", { name: "Missing secret", provider: "local-openai", model: "coder-model", secret_name: "ABSENT" }),
+      /no secret named ABSENT/,
+    );
+    await assert.rejects(
+      store.handle("llm.create", { name: "Half endpoint", provider: "local-openai", model: "coder-model", base_url: "http://x/v1" }),
+      /base_url and api must be set together/,
+    );
+    // Deleting the selected profile leaves the agent with no default at all.
+    assert.equal((await store.handle("llm.delete", { profile_id: stored.profile_id })).deleted, true);
+    assert.deepEqual(await resolveLlmProfile(local, ""), {});
 
     const runtimeValues = {
       ZIDANE_TEST_RUNTIME_VALUE: "blocked",

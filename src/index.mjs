@@ -7,7 +7,6 @@ import { AgentDataStore } from "./agent-data.mjs";
 import {
   applyAgentInfo,
   applyResource,
-  applyLlmProfile,
   applyState,
   clearSessionToken,
   configFromEnv,
@@ -209,33 +208,6 @@ async function handleMessage(message) {
     }
     return;
   }
-  if (message.type === "APPLY_LLM_PROFILE") {
-    try {
-      const profile = await applyLlmProfile(local, message);
-      send("LLM_PROFILE_APPLIED", {
-        revision: message.revision,
-        profile_id: profile.profile_id,
-      });
-      logger.log("info", "LLM profile applied", {
-        revision: message.revision,
-        profile_id: profile.profile_id,
-        provider: profile.provider,
-        model: profile.model,
-      });
-    } catch (error) {
-      send("LLM_PROFILE_REJECTED", {
-        revision: message.revision,
-        profile_id: message.profile_id,
-        error: String(error),
-      });
-      logger.log("error", "LLM profile rejected", {
-        revision: message.revision,
-        profile_id: message.profile_id,
-        error: String(error),
-      });
-    }
-    return;
-  }
   if (message.type === "APPLY_KNOWLEDGE_SOURCE") {
     void knowledge.apply(message).catch(() => undefined);
     return;
@@ -376,7 +348,7 @@ async function connect() {
       capabilities: {
         pi_sdk: true,
         parallel_sessions: config.capacity,
-        agent_storage: { version: 2, resources: ["skills", "config_maps", "secrets"] },
+        agent_storage: { version: 3, resources: ["skills", "config_maps", "secrets", "llm_profiles"] },
         providers: modelCatalog.map((provider) => provider.id),
         model_catalog: modelCatalog,
       },

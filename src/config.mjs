@@ -1,4 +1,4 @@
-import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
 const DEFAULT_WORKDIR = "/var/lib/zidane-agent";
@@ -198,61 +198,46 @@ async function atomicJson(target, value, mode = 0o644) {
   await rename(pending, target);
 }
 
-export async function readSecret(local, name) {
+/** Read one key out of an agent-owned secret directory. */
+export async function readAgentSecret(local, name, key) {
   if (!/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(name)) throw new Error("unsafe secret name");
-  return (await readFile(resolve(local.secrets, name), "utf8")).trim();
+  const directory = resolve(local.syncedSecrets, name);
+  if (dirname(directory) !== local.syncedSecrets) throw new Error("secret path escapes agent store");
+  let chosen = key;
+  if (!chosen) {
+    const files = (await readdir(directory, { withFileTypes: true }))
+      .filter((entry) => entry.isFile() && !entry.name.endsWith(".new"))
+      .map((entry) => entry.name);
+    if (files.length !== 1) throw new Error(`secret ${name} holds several keys; choose the one to use`);
+    chosen = files[0];
+  }
+  if (!/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(chosen)) throw new Error("unsafe secret key");
+  const target = resolve(directory, chosen);
+  if (dirname(target) !== directory) throw new Error("secret path escapes agent store");
+  return (await readFile(target, "utf8")).trim();
 }
 
-export async function applyLlmProfile(local, profile) {
-  const profileId = String(profile.profile_id ?? "");
-  if (!/^[a-zA-Z0-9_-]{1,120}$/.test(profileId)) throw new Error("unsafe LLM profile id");
-  const provider = String(profile.provider ?? "");
-  const model = String(profile.model ?? "");
-  if (!/^[a-z0-9][a-z0-9._-]{0,79}$/.test(provider) || !model) {
-    throw new Error("invalid LLM provider or model");
+/**
+ * Resolve the profile a prompt should run under.
+ *
+ * The agent owns its profiles, so the server sends at most an id; everything else is
+ * read from disk here. A pre-relay agent stored the whole profile in the default
+ * pointer file, which still reads correctly.
+ */
+export async function resolveLlmProfile(local, profileId) {
+  const directory = resolve(local.config, "llm-profiles");
+  const load = async (id) => JSON.parse(await readFile(resolve(directory, `${id}.json`), "utf8"));
+  if (profileId) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$/.test(profileId)) throw new Error("unsafe LLM profile id");
+    return load(profileId);
   }
-  const secretName = `llm-profile-${profileId}`;
-  const secretPath = resolve(local.secrets, secretName);
-  if (profile.credential) {
-    await writeFile(secretPath, String(profile.credential), { mode: 0o600 });
-    await chmod(secretPath, 0o600);
-  } else {
-    await rm(secretPath, { force: true });
+  let pointer;
+  try { pointer = JSON.parse(await readFile(resolve(local.config, "default-llm-profile.json"), "utf8")); }
+  catch { return {}; }
+  if (pointer.profile_id) {
+    try { return await load(String(pointer.profile_id)); } catch { return {}; }
   }
-  if (profile.base_url && profile.api) {
-    const modelsPath = resolve(local.config, "models.json");
-    let models;
-    try { models = JSON.parse(await readFile(modelsPath, "utf8")); } catch { models = { providers: {} }; }
-    models.providers ??= {};
-    const configured = models.providers[provider] ?? {};
-    const modelEntries = Array.isArray(configured.models) ? configured.models : [];
-    if (!modelEntries.some((entry) => entry.id === model)) modelEntries.push({ id: model });
-    models.providers[provider] = {
-      ...configured,
-      baseUrl: String(profile.base_url),
-      api: String(profile.api),
-      models: modelEntries,
-    };
-    await writeFile(modelsPath, JSON.stringify(models, null, 2), { mode: 0o600 });
-  }
-  const stored = {
-    profile_id: profileId,
-    name: String(profile.name ?? profileId),
-    provider,
-    model,
-    secret_name: profile.credential ? secretName : null,
-    base_url: profile.base_url ?? null,
-    api: profile.api ?? null,
-    thinking_level: profile.thinking_level ?? "medium",
-    tools: Array.isArray(profile.tools) ? profile.tools : [],
-  };
-  const profileDirectory = resolve(local.config, "llm-profiles");
-  await mkdir(profileDirectory, { recursive: true });
-  await writeFile(resolve(profileDirectory, `${profileId}.json`), JSON.stringify(stored, null, 2), { mode: 0o600 });
-  if (profile.set_default) {
-    await writeFile(resolve(local.config, "default-llm-profile.json"), JSON.stringify(stored, null, 2), { mode: 0o600 });
-  }
-  return stored;
+  return pointer.provider ? pointer : {};
 }
 
 export async function applyResource(local, kind, name, content) {
