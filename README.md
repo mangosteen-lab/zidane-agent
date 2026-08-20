@@ -33,6 +33,7 @@ memory/          bounded, searchable, TTL-aware durable memories
 knowledge/       connector definitions, local chunks, and citation index
 config/          agent-owned config maps, effective config, LLM profiles, and custom models
 secrets/         rotating/Pi credentials plus agent-owned write-only secrets (mode 0600)
+                 synced/<name>/<key> holds one file per key of a synced secret
 sessions/        redacted Pi event transcripts
 workspaces/      one isolated working directory per conversation
 exports/         portable tar.gz archives
@@ -55,13 +56,19 @@ Valid shell-style config-map keys are applied to the agent process environment; 
 dots or dashes remain available in `config/applied.json`. General synchronized secrets
 are isolated under `secrets/synced/`, whose path is exposed as
 `ZIDANE_AGENT_SYNCED_SECRETS_DIR`, so they cannot overwrite registration or model
-credentials.
+credentials. Each secret is a directory named after the secret containing one mode-0600
+file per key, so a credential with several parts stays together; a secret written by an
+earlier version as a single flat file is migrated to a `value` key on first read.
 
 The agent advertises its versioned local-storage capability at registration. Zidane Web
 can list and CRUD every local `SKILL.md`, named config map, and write-only secret through
 synchronous WebSocket requests. Importing account config maps or encrypted account
-secrets creates agent-local copies; subsequent account changes do not affect those copies
-until they are imported again. Secret values are never returned by the agent.
+secrets creates agent-local copies; subsequent account changes reach those copies only
+when the account is synced again, which also deletes the copies whose account resource is
+no longer shared with this agent. Account skills import the same way and record their
+origin in the skill's `.zidane.json`, so a sync can refresh or remove exactly those
+copies; a `SKILL.md` placed in `skills/` by hand is never touched. Secret values are
+never returned by the agent.
 
 ## Run and test
 

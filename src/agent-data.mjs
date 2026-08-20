@@ -29,6 +29,7 @@ export class AgentDataStore {
     if (operation === "skill.create") return { item: await this.#createSkill(input) };
     if (operation === "skill.update") return { item: await this.#updateSkill(input) };
     if (operation === "skill.delete") return { deleted: await this.#deleteSkill(input.skill_id) };
+    if (operation === "skill.import") return { items: await this.#importSkills(input.items) };
     if (operation === "config.list") return { items: (await this.#loadConfigs()).map(publicConfigSummary) };
     if (operation === "config.get") return { item: await this.#getConfig(input.config_id) };
     if (operation === "config.create") return { item: await this.#createConfig(input) };
@@ -40,6 +41,7 @@ export class AgentDataStore {
     if (operation === "secret.update") return { item: await this.#updateSecret(input) };
     if (operation === "secret.delete") return { deleted: await this.#deleteSecret(input.secret_id) };
     if (operation === "secret.import") return { items: await this.#importSecrets(input.items) };
+    if (operation === "account.refresh") return this.#refreshAccountResources(input);
     throw new Error(`unsupported agent data operation: ${operation}`);
   }
 
@@ -50,25 +52,34 @@ export class AgentDataStore {
     }));
   }
 
+  async #skillDirectory(name) {
+    const base = slug(name) || "skill";
+    let directoryName = base;
+    const existing = new Set((await readdir(this.local.skills, { withFileTypes: true })).map((entry) => entry.name));
+    while (existing.has(directoryName)) directoryName = `${base}-${crypto.randomUUID().slice(0, 8)}`;
+    return resolve(this.local.skills, directoryName);
+  }
+
+  async #writeSkill(directory, metadata, content) {
+    await mkdir(directory, { recursive: true });
+    await writeFile(resolve(directory, "SKILL.md"), content, { mode: 0o644 });
+    await atomicJson(resolve(directory, ".zidane.json"), metadata);
+  }
+
   async #skillEntries() {
     await mkdir(this.local.skills, { recursive: true });
     return discoverSkills(this.local.skills);
   }
 
   async #createSkill(input) {
+    await mkdir(this.local.skills, { recursive: true });
     const name = validName(input.name, "skill");
     const content = validContent(input.content);
-    const base = slug(name) || "skill";
-    let directoryName = base;
-    const existing = new Set((await readdir(this.local.skills, { withFileTypes: true })).map((entry) => entry.name));
-    while (existing.has(directoryName)) directoryName = `${base}-${crypto.randomUUID().slice(0, 8)}`;
-    const directory = resolve(this.local.skills, directoryName);
+    const directory = await this.#skillDirectory(name);
     const timestamp = Date.now();
-    const metadata = { id: crypto.randomUUID(), name, created_at: timestamp, updated_at: timestamp };
-    await mkdir(directory, { recursive: false });
-    await writeFile(resolve(directory, "SKILL.md"), content, { mode: 0o644 });
-    await atomicJson(resolve(directory, ".zidane.json"), metadata);
-    return { skill_id: metadata.id, name, content, created_at: timestamp, updated_at: timestamp };
+    const metadata = { id: crypto.randomUUID(), name, source: { scope: "agent" }, created_at: timestamp, updated_at: timestamp };
+    await this.#writeSkill(directory, metadata, content);
+    return publicSkill({ ...metadata, content });
   }
 
   async #getSkill(skillId) {
@@ -84,14 +95,15 @@ export class AgentDataStore {
     const name = validName(input.name, "skill");
     const content = validContent(input.content);
     const timestamp = Date.now();
-    await writeFile(resolve(entry.directory, "SKILL.md"), content, { mode: 0o644 });
-    await atomicJson(resolve(entry.directory, ".zidane.json"), {
+    const metadata = {
       id: entry.skill_id,
       name,
+      source: entry.source,
       created_at: entry.created_at,
       updated_at: timestamp,
-    });
-    return { skill_id: entry.skill_id, name, content, created_at: entry.created_at, updated_at: timestamp };
+    };
+    await this.#writeSkill(entry.directory, metadata, content);
+    return publicSkill({ ...metadata, content });
   }
 
   async #deleteSkill(skillId) {
@@ -103,6 +115,59 @@ export class AgentDataStore {
       await rm(resolve(entry.directory, ".zidane.json"), { force: true });
     }
     return true;
+  }
+
+  async #importSkills(rawItems) {
+    const incoming = Array.isArray(rawItems) ? rawItems : [];
+    if (!incoming.length || incoming.length > 100) throw new Error("select between 1 and 100 skills");
+    await mkdir(this.local.skills, { recursive: true });
+    const entries = await this.#skillEntries();
+    const imported = [];
+    for (const raw of incoming) {
+      const sourceId = validId(raw.source_id, "account skill");
+      const name = validName(raw.name, "skill");
+      const content = validContent(raw.content);
+      const existing = entries.find((item) => item.source?.scope === "account" && item.source.id === sourceId);
+      const timestamp = Date.now();
+      const metadata = {
+        id: existing?.skill_id ?? crypto.randomUUID(),
+        name,
+        source: { scope: "account", id: sourceId },
+        created_at: existing?.created_at ?? timestamp,
+        updated_at: timestamp,
+      };
+      await this.#writeSkill(existing?.directory ?? (await this.#skillDirectory(name)), metadata, content);
+      imported.push(publicSkill({ ...metadata, content }));
+    }
+    return imported;
+  }
+
+  async #refreshAccountSkills(incoming) {
+    const allowed = new Map(incoming.map((raw) => [validId(raw.source_id, "account skill"), raw]));
+    let updated = 0;
+    let removed = 0;
+    for (const entry of await this.#skillEntries()) {
+      if (entry.source?.scope !== "account") continue;
+      const raw = allowed.get(entry.source.id);
+      if (!raw) {
+        await rm(entry.directory, { recursive: true, force: true });
+        removed += 1;
+        continue;
+      }
+      await this.#writeSkill(
+        entry.directory,
+        {
+          id: entry.skill_id,
+          name: validName(raw.name, "skill"),
+          source: entry.source,
+          created_at: entry.created_at,
+          updated_at: Date.now(),
+        },
+        validContent(raw.content),
+      );
+      updated += 1;
+    }
+    return { updated, removed };
   }
 
   async #loadConfigs() {
@@ -220,19 +285,21 @@ export class AgentDataStore {
 
   async #loadSecrets() {
     await mkdir(this.local.syncedSecrets, { recursive: true });
+    await this.#migrateFlatSecrets();
     const stored = await readJson(this.secretMetadata, []);
     let items = Array.isArray(stored) ? stored : [];
     const storedCount = items.length;
-    const files = new Set(
-      (await readdir(this.local.syncedSecrets, { withFileTypes: true }))
-        .filter((entry) => entry.isFile() && !entry.name.endsWith(".new") && SAFE_KEY.test(entry.name))
-        .map((entry) => entry.name),
-    );
-    items = items.filter((item) => SAFE_ID.test(String(item.id ?? "")) && SAFE_KEY.test(String(item.name ?? "")) && files.has(item.name));
+    const directories = new Map();
+    for (const entry of await readdir(this.local.syncedSecrets, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !SAFE_KEY.test(entry.name)) continue;
+      const directory = resolve(this.local.syncedSecrets, entry.name);
+      await chmod(directory, 0o700);
+      directories.set(entry.name, await secretKeys(directory));
+    }
+    items = items.filter((item) => SAFE_ID.test(String(item.id ?? "")) && SAFE_KEY.test(String(item.name ?? "")) && directories.has(item.name));
     const knownNames = new Set(items.map((item) => item.name));
     let changed = !Array.isArray(stored) || items.length !== storedCount;
-    for (const name of files) {
-      await chmod(resolve(this.local.syncedSecrets, name), 0o600);
+    for (const name of directories.keys()) {
       if (knownNames.has(name)) continue;
       const details = await stat(resolve(this.local.syncedSecrets, name));
       items.push({
@@ -245,32 +312,60 @@ export class AgentDataStore {
       changed = true;
     }
     if (changed) await this.#saveSecretMetadata(items);
-    return items.sort((left, right) => left.created_at - right.created_at || left.name.localeCompare(right.name));
+    return items
+      .map((item) => ({ ...item, keys: directories.get(item.name) ?? [] }))
+      .sort((left, right) => left.created_at - right.created_at || left.name.localeCompare(right.name));
+  }
+
+  /** A secret used to be one flat file; it is now a directory of key files. */
+  async #migrateFlatSecrets() {
+    for (const entry of await readdir(this.local.syncedSecrets, { withFileTypes: true })) {
+      if (!entry.isFile() || entry.name.endsWith(".new") || !SAFE_KEY.test(entry.name)) continue;
+      const flat = resolve(this.local.syncedSecrets, entry.name);
+      const value = await readFile(flat, "utf8");
+      await rm(flat, { force: true });
+      await this.#writeSecretEntries(entry.name, { value });
+    }
   }
 
   async #saveSecretMetadata(items) {
-    await atomicJson(this.secretMetadata, items, 0o600);
+    await atomicJson(this.secretMetadata, items.map(({ keys: _keys, ...item }) => item), 0o600);
   }
 
-  async #writeSecret(name, value) {
+  #secretDirectory(name) {
     const target = resolve(this.local.syncedSecrets, name);
     if (dirname(target) !== this.local.syncedSecrets) throw new Error("secret path escapes agent store");
-    const pending = `${target}.new`;
-    await writeFile(pending, validSecretValue(value), { mode: 0o600 });
-    await rename(pending, target);
-    await chmod(target, 0o600);
+    return target;
+  }
+
+  /** Write every key and drop the ones this revision no longer carries. */
+  async #writeSecretEntries(name, values) {
+    const directory = this.#secretDirectory(name);
+    await mkdir(directory, { recursive: true });
+    await chmod(directory, 0o700);
+    for (const key of await secretKeys(directory)) {
+      if (!(key in values)) await rm(resolve(directory, key), { force: true });
+    }
+    for (const [key, value] of Object.entries(values)) {
+      const target = resolve(directory, key);
+      const pending = `${target}.new`;
+      await writeFile(pending, value, { mode: 0o600 });
+      await rename(pending, target);
+      await chmod(target, 0o600);
+    }
   }
 
   async #createSecret(input) {
     const items = await this.#loadSecrets();
     const name = validSecretName(input.name);
     if (items.some((item) => item.name === name)) throw new Error("an agent secret with this name already exists");
+    const values = validSecretValues(input.values);
     const timestamp = Date.now();
     const item = { id: crypto.randomUUID(), name, source: { scope: "agent" }, created_at: timestamp, updated_at: timestamp };
-    await this.#writeSecret(name, input.value);
+    await this.#writeSecretEntries(name, values);
     items.push(item);
     await this.#saveSecretMetadata(items);
-    return publicSecret(item);
+    return publicSecret({ ...item, keys: Object.keys(values).sort() });
   }
 
   async #updateSecret(input) {
@@ -280,12 +375,14 @@ export class AgentDataStore {
     if (!item) throw new Error("secret not found");
     const name = validSecretName(input.name);
     if (items.some((candidate) => candidate.id !== secretId && candidate.name === name)) throw new Error("an agent secret with this name already exists");
+    const values = validSecretValues(input.values);
     const oldName = item.name;
-    await this.#writeSecret(name, input.value);
+    await this.#writeSecretEntries(name, values);
     item.name = name;
+    item.keys = Object.keys(values).sort();
     item.updated_at = Date.now();
     await this.#saveSecretMetadata(items);
-    if (oldName !== name) await rm(resolve(this.local.syncedSecrets, oldName), { force: true });
+    if (oldName !== name) await rm(this.#secretDirectory(oldName), { recursive: true, force: true });
     return publicSecret(item);
   }
 
@@ -294,7 +391,7 @@ export class AgentDataStore {
     const items = await this.#loadSecrets();
     const item = items.find((candidate) => candidate.id === secretId);
     if (!item) return false;
-    await rm(resolve(this.local.syncedSecrets, item.name), { force: true });
+    await rm(this.#secretDirectory(item.name), { recursive: true, force: true });
     await this.#saveSecretMetadata(items.filter((candidate) => candidate.id !== secretId));
     return true;
   }
@@ -318,16 +415,88 @@ export class AgentDataStore {
       item.name = name;
       item.updated_at = timestamp;
       if (!existing) planned.push(item);
-      changes.push({ item, oldName, value: validSecretValue(raw.value) });
+      changes.push({ item, oldName, values: validSecretValues(raw.values) });
     }
-    for (const change of changes) await this.#writeSecret(change.item.name, change.value);
+    for (const change of changes) {
+      await this.#writeSecretEntries(change.item.name, change.values);
+      change.item.keys = Object.keys(change.values).sort();
+    }
     await this.#saveSecretMetadata(planned);
     for (const change of changes) {
-      if (change.oldName && change.oldName !== change.item.name) await rm(resolve(this.local.syncedSecrets, change.oldName), { force: true });
-      change.value = "";
+      if (change.oldName && change.oldName !== change.item.name) {
+        await rm(this.#secretDirectory(change.oldName), { recursive: true, force: true });
+      }
+      change.values = {};
     }
     return changes.map((change) => publicSecret(change.item));
   }
+
+  /** Re-apply the account resources this agent may still see, and drop the rest. */
+  async #refreshAccountResources(input) {
+    return {
+      skills: await this.#refreshAccountSkills(Array.isArray(input.skills) ? input.skills : []),
+      configs: await this.#refreshAccountConfigs(Array.isArray(input.configs) ? input.configs : []),
+      secrets: await this.#refreshAccountSecrets(Array.isArray(input.secrets) ? input.secrets : []),
+    };
+  }
+
+  async #refreshAccountConfigs(incoming) {
+    const allowed = new Map(incoming.map((raw) => [validId(raw.source_id, "account configuration"), raw]));
+    const kept = [];
+    let updated = 0;
+    let removed = 0;
+    for (const item of await this.#loadConfigs()) {
+      if (item.source?.scope !== "account") { kept.push(item); continue; }
+      const raw = allowed.get(item.source.id);
+      if (!raw) {
+        await rm(resolve(this.configDirectory, `${item.id}.json`), { force: true });
+        removed += 1;
+        continue;
+      }
+      item.name = validName(raw.name, "configuration");
+      item.values = validValues(raw.values);
+      item.updated_at = Date.now();
+      await this.#saveConfig(item);
+      updated += 1;
+      kept.push(item);
+    }
+    if (updated || removed) await this.#materializeConfigs(kept);
+    return { updated, removed };
+  }
+
+  async #refreshAccountSecrets(incoming) {
+    const allowed = new Map(incoming.map((raw) => [validId(raw.source_id, "account secret"), raw]));
+    const items = await this.#loadSecrets();
+    const kept = [];
+    let updated = 0;
+    let removed = 0;
+    for (const item of items) {
+      if (item.source?.scope !== "account") { kept.push(item); continue; }
+      const raw = allowed.get(item.source.id);
+      if (!raw) {
+        await rm(this.#secretDirectory(item.name), { recursive: true, force: true });
+        removed += 1;
+        continue;
+      }
+      const name = validSecretName(raw.name);
+      // A rename must not land on any other secret, including one not yet visited.
+      if (items.some((candidate) => candidate.id !== item.id && candidate.name === name)) {
+        throw new Error(`an agent secret named ${name} already exists`);
+      }
+      const values = validSecretValues(raw.values);
+      const oldName = item.name;
+      await this.#writeSecretEntries(name, values);
+      if (oldName !== name) await rm(this.#secretDirectory(oldName), { recursive: true, force: true });
+      item.name = name;
+      item.keys = Object.keys(values).sort();
+      item.updated_at = Date.now();
+      updated += 1;
+      kept.push(item);
+    }
+    await this.#saveSecretMetadata(kept);
+    return { updated, removed };
+  }
+
 }
 
 async function discoverSkills(root) {
@@ -347,6 +516,9 @@ async function discoverSkills(root) {
         found.push({
           skill_id: managed ? metadata.id : `manual-${createHash("sha256").update(relativePath).digest("hex").slice(0, 16)}`,
           name: validStoredName(metadata?.name) ?? inferredSkillName(content, entry.name),
+          source: managed && metadata.source?.scope === "account" && SAFE_ID.test(String(metadata.source.id ?? ""))
+            ? { scope: "account", id: String(metadata.source.id) }
+            : { scope: managed ? "agent" : "manual" },
           content,
           created_at: Number(metadata?.created_at) || details.birthtimeMs || details.mtimeMs,
           updated_at: Number(metadata?.updated_at) || details.mtimeMs,
@@ -415,14 +587,44 @@ function validSecretName(value) {
   return name;
 }
 
-function validSecretValue(value) {
-  const secret = String(value ?? "");
-  if (!secret || Buffer.byteLength(secret) > MAX_VALUE_BYTES) throw new Error("secret value must contain 1 to 1000000 bytes");
-  return secret;
+function validSecretValues(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("secret values must be a key/value map");
+  const entries = Object.entries(value);
+  if (!entries.length) throw new Error("a secret needs at least one key");
+  if (entries.length > 500) throw new Error("a secret cannot hold more than 500 keys");
+  const clean = {};
+  let size = 0;
+  for (const [key, item] of entries) {
+    if (!SAFE_KEY.test(key) || key.length > 120) throw new Error(`unsafe secret key: ${key}`);
+    const secret = String(item ?? "");
+    size += Buffer.byteLength(secret);
+    if (!secret || size > MAX_VALUE_BYTES) throw new Error("secret values must contain 1 to 1000000 bytes");
+    clean[key] = secret;
+  }
+  return clean;
+}
+
+async function secretKeys(directory) {
+  const entries = await readdir(directory, { withFileTypes: true });
+  return entries
+    .filter((entry) => entry.isFile() && !entry.name.endsWith(".new") && SAFE_KEY.test(entry.name))
+    .map((entry) => entry.name)
+    .sort();
 }
 
 function slug(value) {
   return value.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80);
+}
+
+function publicSkill(item) {
+  return {
+    skill_id: item.id,
+    name: item.name,
+    content: item.content,
+    source: item.source ?? { scope: "agent" },
+    created_at: item.created_at,
+    updated_at: item.updated_at,
+  };
 }
 
 function publicConfig(item) {
@@ -442,9 +644,12 @@ function publicConfigSummary(item) {
 }
 
 function publicSecret(item) {
+  const keys = item.keys ?? [];
   return {
     secret_id: item.id,
     name: item.name,
+    keys,
+    entry_count: keys.length,
     source: item.source ?? { scope: "agent" },
     created_at: item.created_at,
     updated_at: item.updated_at,

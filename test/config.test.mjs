@@ -43,24 +43,41 @@ test("LLM profiles and rotating sessions persist without embedding credentials",
     assert.doesNotMatch(modelsFile, /model-secret/);
     assert.equal(JSON.parse(modelsFile).providers["local-openai"].models[0].id, "coder-model");
 
+    const runtimeValues = {
+      ZIDANE_TEST_RUNTIME_VALUE: "blocked",
+      AGENT_TEST_SETTING: "enabled",
+      "setting.with.dots": "stored-only",
+    };
     await applyState(
       local,
       "revision-1",
-      { ZIDANE_TEST_RUNTIME_VALUE: "blocked", AGENT_TEST_SETTING: "enabled", "setting.with.dots": "stored-only" },
-      { "session-token": "must-not-replace-auth", TOOL_PASSWORD: "tool-secret" },
+      runtimeValues,
+      {
+        "session-token": { value: "must-not-replace-auth" },
+        TOOL_PASSWORD: { password: "tool-secret", username: "tool-user" },
+      },
     );
     assert.equal(process.env.AGENT_TEST_SETTING, "enabled");
     assert.notEqual(process.env.ZIDANE_TEST_RUNTIME_VALUE, "blocked");
     assert.equal(await readSessionToken(local), "rotating-session");
-    assert.equal(await readFile(resolve(local.syncedSecrets, "session-token"), "utf8"), "must-not-replace-auth");
-    assert.equal((await stat(resolve(local.syncedSecrets, "TOOL_PASSWORD"))).mode & 0o777, 0o600);
+    assert.equal(await readSessionToken(local), "rotating-session");
+    assert.equal(await readFile(resolve(local.syncedSecrets, "session-token", "value"), "utf8"), "must-not-replace-auth");
+    assert.equal(await readFile(resolve(local.syncedSecrets, "TOOL_PASSWORD", "username"), "utf8"), "tool-user");
+    assert.equal((await stat(resolve(local.syncedSecrets, "TOOL_PASSWORD", "password"))).mode & 0o777, 0o600);
+    assert.equal((await stat(resolve(local.syncedSecrets, "TOOL_PASSWORD"))).mode & 0o777, 0o700);
     delete process.env.AGENT_TEST_SETTING;
     await initialise({ name: "test", version: "1", description: "test", workingDirectory: root });
     assert.equal(process.env.AGENT_TEST_SETTING, "enabled");
 
+    // A revision that drops one key of a secret removes just that file.
+    await applyState(local, "revision-1b", runtimeValues, { TOOL_PASSWORD: { password: "tool-secret" } });
+    await assert.rejects(readFile(resolve(local.syncedSecrets, "TOOL_PASSWORD", "username")), { code: "ENOENT" });
+    assert.equal(await readFile(resolve(local.syncedSecrets, "TOOL_PASSWORD", "password"), "utf8"), "tool-secret");
+    await assert.rejects(readFile(resolve(local.syncedSecrets, "session-token", "value")), { code: "ENOENT" });
+
     await applyState(local, "revision-2", {}, {});
     assert.equal(process.env.AGENT_TEST_SETTING, undefined);
-    await assert.rejects(readFile(resolve(local.syncedSecrets, "TOOL_PASSWORD")), { code: "ENOENT" });
+    await assert.rejects(readFile(resolve(local.syncedSecrets, "TOOL_PASSWORD", "password")), { code: "ENOENT" });
   } finally {
     delete process.env.AGENT_TEST_SETTING;
     delete process.env.ZIDANE_TEST_RUNTIME_VALUE;

@@ -131,25 +131,61 @@ export async function applyConfigValues(local, revision, values) {
   await atomicJson(appliedPath, { revision, values: cleanValues });
 }
 
+const SAFE_SECRET_KEY = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
+
+/** A secret is a named directory of mode-0600 key files, mirroring a config map. */
 async function applySyncedSecrets(local, secretValues) {
-  const nextSecrets = Object.keys(secretValues ?? {});
-  const unsafeSecret = nextSecrets.find((name) => !/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(name));
-  if (unsafeSecret) throw new Error(`unsafe secret name: ${unsafeSecret}`);
+  const next = {};
+  for (const [name, entries] of Object.entries(secretValues ?? {})) {
+    if (!SAFE_SECRET_KEY.test(name)) throw new Error(`unsafe secret name: ${name}`);
+    next[name] = normaliseSecretEntries(name, entries);
+  }
   const appliedSecretsPath = resolve(local.config, "applied-secrets.json");
-  let previousSecrets = [];
-  try { previousSecrets = JSON.parse(await readFile(appliedSecretsPath, "utf8")); } catch { /* first application */ }
-  for (const name of previousSecrets) {
-    if (!nextSecrets.includes(name) && /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(name)) {
-      await rm(resolve(local.syncedSecrets, name), { force: true });
+  let previous = {};
+  try { previous = JSON.parse(await readFile(appliedSecretsPath, "utf8")); } catch { /* first application */ }
+  // A list is what versions before key/value secrets wrote here.
+  if (Array.isArray(previous)) previous = Object.fromEntries(previous.map((name) => [name, null]));
+  for (const [name, keys] of Object.entries(previous)) {
+    if (!SAFE_SECRET_KEY.test(name)) continue;
+    const target = secretDirectory(local, name);
+    if (!(name in next)) { await rm(target, { recursive: true, force: true }); continue; }
+    if (!Array.isArray(keys)) { await rm(target, { recursive: true, force: true }); continue; }
+    for (const key of keys) {
+      if (SAFE_SECRET_KEY.test(key) && !(key in next[name])) await rm(resolve(target, key), { force: true });
     }
   }
-  for (const [name, value] of Object.entries(secretValues ?? {})) {
-    const target = resolve(local.syncedSecrets, name);
-    if (dirname(target) !== local.syncedSecrets) throw new Error("secret path escapes state directory");
-    await writeFile(target, String(value), { mode: 0o600 });
-    await chmod(target, 0o600);
+  for (const [name, entries] of Object.entries(next)) {
+    const directory = secretDirectory(local, name);
+    await mkdir(directory, { recursive: true });
+    await chmod(directory, 0o700);
+    for (const [key, value] of Object.entries(entries)) {
+      await writeFile(resolve(directory, key), value, { mode: 0o600 });
+      await chmod(resolve(directory, key), 0o600);
+    }
   }
-  await atomicJson(appliedSecretsPath, nextSecrets, 0o600);
+  await atomicJson(
+    appliedSecretsPath,
+    Object.fromEntries(Object.entries(next).map(([name, entries]) => [name, Object.keys(entries)])),
+    0o600,
+  );
+}
+
+function secretDirectory(local, name) {
+  const target = resolve(local.syncedSecrets, name);
+  if (dirname(target) !== local.syncedSecrets) throw new Error("secret path escapes state directory");
+  return target;
+}
+
+function normaliseSecretEntries(name, entries) {
+  // A server predating key/value secrets sends one bare string per secret.
+  const values = typeof entries === "string" ? { value: entries } : entries;
+  if (!values || typeof values !== "object" || Array.isArray(values)) throw new Error(`secret ${name} must be a key/value map`);
+  const clean = {};
+  for (const [key, value] of Object.entries(values)) {
+    if (!SAFE_SECRET_KEY.test(key)) throw new Error(`unsafe secret key: ${name}.${key}`);
+    clean[key] = String(value);
+  }
+  return clean;
 }
 
 function isRuntimeEnvironmentKey(key) {

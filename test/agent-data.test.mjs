@@ -34,6 +34,19 @@ test("agent-owned skills, config maps, and secrets support local CRUD and accoun
     assert.equal(updatedSkill.name, "Deploy with checks");
     assert.equal((await store.handle("skill.delete", { skill_id: createdSkill.skill_id })).deleted, true);
 
+    const importedSkills = (await store.handle("skill.import", {
+      items: [{ source_id: "account-skill-1", name: "Incident response", content: "# Incident response\n" }],
+    })).items;
+    assert.equal(importedSkills[0].source.scope, "account");
+    assert.equal(importedSkills[0].source.id, "account-skill-1");
+    // Re-importing the same account skill updates the copy in place.
+    const reimported = (await store.handle("skill.import", {
+      items: [{ source_id: "account-skill-1", name: "Incident response", content: "# Incident response v2\n" }],
+    })).items;
+    assert.equal(reimported[0].skill_id, importedSkills[0].skill_id);
+    assert.equal((await store.handle("skill.list")).items.filter((item) => item.source.scope === "account").length, 1);
+    assert.match((await store.handle("skill.get", { skill_id: reimported[0].skill_id })).item.content, /v2/);
+
     const localConfig = (await store.handle("config.create", {
       name: "Local runtime",
       values: { [environmentKey]: "local", "setting.with.dots": "stored" },
@@ -58,18 +71,59 @@ test("agent-owned skills, config maps, and secrets support local CRUD and accoun
     assert.equal(process.env[environmentKey], undefined);
     assert.equal(JSON.parse(await readFile(resolve(local.config, "applied.json"), "utf8")).values.IMPORTED_SETTING, "yes");
 
-    const localSecret = (await store.handle("secret.create", { name: "LOCAL_TOKEN", value: "local-secret-value" })).item;
-    assert.equal(await readFile(resolve(local.syncedSecrets, "LOCAL_TOKEN"), "utf8"), "local-secret-value");
-    assert.equal((await stat(resolve(local.syncedSecrets, "LOCAL_TOKEN"))).mode & 0o777, 0o600);
+    const localSecret = (await store.handle("secret.create", {
+      name: "LOCAL_TOKEN",
+      values: { api_key: "local-secret-value", org_id: "org-42" },
+    })).item;
+    assert.deepEqual(localSecret.keys, ["api_key", "org_id"]);
+    assert.equal(await readFile(resolve(local.syncedSecrets, "LOCAL_TOKEN", "api_key"), "utf8"), "local-secret-value");
+    assert.equal((await stat(resolve(local.syncedSecrets, "LOCAL_TOKEN", "api_key"))).mode & 0o777, 0o600);
+    assert.equal((await stat(resolve(local.syncedSecrets, "LOCAL_TOKEN"))).mode & 0o777, 0o700);
     const importedSecrets = (await store.handle("secret.import", {
-      items: [{ source_id: "account-secret-1", name: "ACCOUNT_TOKEN", value: "account-secret-value" }],
+      items: [{ source_id: "account-secret-1", name: "ACCOUNT_TOKEN", values: { token: "account-secret-value" } }],
     })).items;
     assert.equal(importedSecrets[0].source.scope, "account");
+    assert.deepEqual(importedSecrets[0].keys, ["token"]);
     assert.doesNotMatch(JSON.stringify(await store.handle("secret.list")), /local-secret-value|account-secret-value/);
-    await store.handle("secret.update", { secret_id: localSecret.secret_id, name: "RENAMED_TOKEN", value: "replacement-value" });
-    assert.equal(await readFile(resolve(local.syncedSecrets, "RENAMED_TOKEN"), "utf8"), "replacement-value");
-    await assert.rejects(readFile(resolve(local.syncedSecrets, "LOCAL_TOKEN")), { code: "ENOENT" });
+    await store.handle("secret.update", {
+      secret_id: localSecret.secret_id,
+      name: "RENAMED_TOKEN",
+      values: { api_key: "replacement-value" },
+    });
+    assert.equal(await readFile(resolve(local.syncedSecrets, "RENAMED_TOKEN", "api_key"), "utf8"), "replacement-value");
+    // The dropped key goes with the rename; a write replaces the whole map.
+    await assert.rejects(readFile(resolve(local.syncedSecrets, "RENAMED_TOKEN", "org_id")), { code: "ENOENT" });
+    await assert.rejects(readFile(resolve(local.syncedSecrets, "LOCAL_TOKEN", "api_key")), { code: "ENOENT" });
+    await assert.rejects(store.handle("secret.create", { name: "EMPTY", values: {} }), /at least one key/);
     assert.equal((await store.handle("secret.delete", { secret_id: localSecret.secret_id })).deleted, true);
+
+    // An account refresh updates the imported copies and removes the revoked ones.
+    const refreshed = await store.handle("account.refresh", {
+      skills: [{ source_id: "account-skill-1", name: "Incident response", content: "# Incident response v3\n" }],
+      configs: [{ source_id: "account-config-1", name: "Account defaults", values: { IMPORTED_SETTING: "refreshed" } }],
+      secrets: [{ source_id: "account-secret-1", name: "ACCOUNT_TOKEN", values: { token: "rotated-value" } }],
+    });
+    assert.deepEqual(refreshed, {
+      skills: { updated: 1, removed: 0 },
+      configs: { updated: 1, removed: 0 },
+      secrets: { updated: 1, removed: 0 },
+    });
+    assert.match((await store.handle("skill.get", { skill_id: importedSkills[0].skill_id })).item.content, /v3/);
+    assert.equal(process.env.IMPORTED_SETTING, "refreshed");
+    assert.equal(await readFile(resolve(local.syncedSecrets, "ACCOUNT_TOKEN", "token"), "utf8"), "rotated-value");
+
+    const revoked = await store.handle("account.refresh", { skills: [], configs: [], secrets: [] });
+    assert.deepEqual(revoked, {
+      skills: { updated: 0, removed: 1 },
+      configs: { updated: 0, removed: 1 },
+      secrets: { updated: 0, removed: 1 },
+    });
+    // The manual skill written outside Zidane is never touched by an account sync.
+    const survivingSkills = (await store.handle("skill.list")).items;
+    assert.deepEqual(survivingSkills.map((item) => item.name), ["manual-skill"]);
+    assert.equal(process.env.IMPORTED_SETTING, undefined);
+    await assert.rejects(stat(resolve(local.syncedSecrets, "ACCOUNT_TOKEN")), { code: "ENOENT" });
+    assert.equal((await store.handle("secret.list")).items.length, 0);
   } finally {
     delete process.env[environmentKey];
     delete process.env.IMPORTED_SETTING;
