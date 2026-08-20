@@ -3,6 +3,7 @@
 .git
 .github
 .venv
+node_modules
 dist
 state
 work

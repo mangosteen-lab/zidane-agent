@@ -1,70 +1,49 @@
 name: release
 
-# Pushing a tag (`git tag v0.2.0 && git push --tags`, or `make release VERSION=0.2.0`)
-# builds the agent tarball, publishes it to a GitHub Release with its sha256, and pushes
-# the container image to GHCR.
-#
-# The tarball is deliberately **flat** — app/, pyproject.toml at the top level, no
-# directory prefix. app/updater.py extracts it straight into versions/<version>/ without
-# stripping components, so a prefixed archive would land the code one directory too deep
-# and the agent would fail to start after upgrading.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
 
 permissions:
-  contents: write   # create the Release
-  packages: write   # push to GHCR
+  contents: write
+  packages: write
 
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Derive version
-        id: vars
+      - uses: actions/setup-node@v4
+        with: { node-version: "22.23.0", cache: npm }
+      - run: npm ci
+      - run: npm run check && npm test
+      - name: Verify tag and build portable service bundle
+        id: version
+        shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "sha_short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-
-      - name: Check the two version sites agree
-        run: |
-          pyproject=$(python3 -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
-          client=$(python3 -c "import re,pathlib;print(re.search(r'AGENT_VERSION = \"([^\"]+)\"',pathlib.Path('app/client.py').read_text()).group(1))")
-          echo "pyproject=$pyproject client=$client tag=${{ steps.vars.outputs.version }}"
-          # The agent reports app/client.py's value; the backend compares against it to
-          # decide whether an upgrade is needed. A mismatch upgrades the fleet in a loop.
-          test "$pyproject" = "$client"
-          test "$pyproject" = "${{ steps.vars.outputs.version }}"
-
-      - name: Build tarball + checksum
-        run: |
-          make release-tarball
-          cd dist && sha256sum *.tar.gz | tee SHA256SUMS
-
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
+          package_version=$(node -p "require('./package.json').version")
+          test "${version}" = "${package_version}"
+          mkdir -p dist
+          tar --exclude=node_modules --exclude=dist -czf "dist/zidane-agent-${version}.tar.gz" package.json package-lock.json src services scripts README.md Dockerfile
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+      - uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/*.tar.gz
             dist/SHA256SUMS
           generate_release_notes: true
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
+      - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push the image
-        uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.vars.outputs.version }}
+            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
             ghcr.io/${{ github.repository }}:latest

@@ -1,0 +1,11 @@
+<service>
+  <id>zidane-agent</id>
+  <name>Zidane Agent</name>
+  <description>Autonomous Zidane agent powered by the Pi SDK.</description>
+  <executable>C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe</executable>
+  <arguments>-NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\Zidane Agent\run-agent.ps1"</arguments>
+  <workingdirectory>C:\Program Files\Zidane Agent</workingdirectory>
+  <log mode="roll-by-size"><sizeThreshold>10240</sizeThreshold><keepFiles>5</keepFiles></log>
+  <onfailure action="restart" delay="5 sec" />
+  <stoptimeout>30 sec</stoptimeout>
+</service>

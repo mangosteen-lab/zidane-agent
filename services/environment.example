@@ -1,0 +1,6 @@
+ZIDANE_AGENT_SERVER_URL=wss://zidane.example.com/ws/agent
+ZIDANE_AGENT_API_KEY=replace-with-one-time-registration-key
+ZIDANE_AGENT_NAME=host-agent
+ZIDANE_AGENT_DESCRIPTION=Autonomous Pi coding agent
+ZIDANE_AGENT_CAPACITY=2
+ZIDANE_AGENT_WORKING_DIRECTORY=/var/lib/zidane-agent

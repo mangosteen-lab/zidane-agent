@@ -1,0 +1,21 @@
+[Unit]
+Description=Zidane Pi Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zidane
+Group=zidane
+EnvironmentFile=/etc/zidane-agent/environment
+WorkingDirectory=/opt/zidane-agent
+ExecStart=/usr/bin/env node /opt/zidane-agent/src/index.mjs
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/zidane-agent
+
+[Install]
+WantedBy=multi-user.target

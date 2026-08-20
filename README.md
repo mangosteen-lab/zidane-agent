@@ -1,219 +1,114 @@
-# zidane-agent
+# Zidane Agent
 
-The Zidane worker. Connects **outbound** to the backend over a WebSocket, registers this
-host with its labels and capacity, runs the scripts it is sent, and streams logs back.
-Because the connection is outbound only, hosts behind NAT or a firewall need no inbound
-rules.
-
-Protocol contract: `../zidane-backend/docs/design/02-agent-protocol.md`. Any change lands
-here and in `zidane-backend/app/ws/agent_ws.py` in the same commit.
-
-## Install on a machine
-
-The repo is public, so these run unauthenticated anywhere:
-
-```bash
-# install (or upgrade in place) — downloads the latest release and verifies its sha256
-curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/zidane-agent/main/scripts/install.sh \
-  | sudo bash -s -- --url wss://<backend>:17001/ws/agent --token <YOUR_TOKEN>
-
-# upgrade to the latest release, or to a specific one
-curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/zidane-agent/main/scripts/upgrade.sh | sudo bash
-sudo bash upgrade.sh --version 0.3.0
-sudo bash upgrade.sh --rollback
-
-# uninstall — keeps conf/ and logs/ unless you pass --purge
-curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/zidane-agent/main/scripts/uninstall.sh | sudo bash
-```
-
-Get the token from the console: **Settings → Agent registration tokens → Create**. It is
-shown once. Windows has `install.ps1` (`irm ... | iex`).
-
-Use `wss://` only when something terminates TLS in front of the backend; a backend started
-with `make run` serves plain HTTP and needs `ws://`. The mismatch shows up as
-`[SSL: WRONG_VERSION_NUMBER]`, which the agent now annotates with the fix.
-
-### Container
-
-```bash
-docker run -d --name zidane-agent --restart unless-stopped \
-  -e ZIDANE_BACKEND_WSS_URL=wss://zidane.example.com:17001/ws/agent \
-  -e ZIDANE_BACKEND_API_KEY=zdn_... \
-  -e ZIDANE_AGENT_LABELS="os=linux,template=UBUNTU_2404" \
-  ghcr.io/mangosteen-lab/zidane-agent:latest
-```
-
-`ubuntu:24.04` with a general build toolchain — Python 3.12, Node 22, JDK 21, Maven,
-Gradle 8.10, git, build-essential (~1.3GB). One image on purpose: the workflows this fleet
-runs are mixed-language, and a step that lands on an agent missing its toolchain fails at
-run time rather than at placement. Splitting per language means labelling the images
-accurately and keeping selectors in step with reality — worth doing when the size hurts,
-not before.
-
-**Naming.** `docker run --name` names the *container*, not the agent. Pass the name — and
-the matching hostname — or the agent registers as the random container id:
-
-```bash
-docker run -d --name build-01 --hostname build-01 \
-  -e ZIDANE_AGENT_NAME=build-01 ...
-```
-
-`--hostname` is not cosmetic: the backend reuses an agent record only when hostname **and**
-name match, so a container recreated without it registers as a *new* agent and leaves the
-old one behind as a ghost. `install-container.sh` sets both. Bind-mounting `state/` achieves
-the same thing by a different route — the session token in it re-registers the same
-`agent_id` — and is what you want anyway so in-flight results survive a restart.
-
-Configuration is entirely by environment; the image ships **no** config.ini, so a token
-can never be baked into a layer. `ZIDANE_BACKEND_WSS_URL` and `ZIDANE_BACKEND_API_KEY` are
-required, everything else has a default. The entrypoint renders the config on every start,
-which means the environment always wins — a backend `SET_CONFIG` push (capacity, labels)
-applies at run time but is overwritten at the next restart, so set only what you mean to
-pin.
-
-**It upgrades on restart.** The entrypoint pulls the latest published release, verifies its
-sha256, installs it beside the baked one and flips `current` — the same versioned layout as
-a machine install, under the same `/opt/mangosteen/zidane-agent`. So `docker restart` moves
-the agent; `docker pull` moves the toolchain. Failure to reach GitHub is **not** fatal: an
-air-gapped or rate-limited container starts on the version baked into the image rather than
-crash-looping. `ZIDANE_UPGRADE_ON_START=0` pins it.
-
-The container runs as `zidane` (uid 1001), not root — the agent refuses to run as root, and
-that applies here too. Tasks run in per-task directories under
-`/opt/mangosteen/zidane-workspace`, which is also the container's working directory.
-
-Installs land in a versioned tree, which is what makes an upgrade reversible:
-
-```
-/opt/mangosteen/zidane-agent/versions/0.1.0/    previous, kept
-/opt/mangosteen/zidane-agent/versions/0.2.0/    new
-/opt/mangosteen/zidane-agent/current -> versions/0.2.0
-/opt/mangosteen/zidane-agent/conf/config.ini    never touched by an upgrade
-```
-
-The symlink flip is atomic (`os.replace`), so a crash mid-upgrade cannot leave `current`
-dangling. `--rollback` re-points it at the previous version without downloading anything.
-
-An agent with `auto_upgrade = true` does the same thing on its own when the backend
-advertises a newer release (`app/updater.py`); `upgrade.sh` is for when auto-upgrade is
-off, or to move one machine ahead of the fleet.
-
-## Releasing
-
-```bash
-make release VERSION=0.2.0     # bump, commit, tag, build, publish, print the backend config
-```
-
-`scripts/release.sh` bumps the version in **both** places it lives — `pyproject.toml` and
-`AGENT_VERSION` in `app/client.py` — then tags, builds the tarball, and publishes it to
-GitHub Releases with a `SHA256SUMS` asset. Pushing the tag also triggers
-`.github/workflows/release.yml`, which does the same build and pushes the container image
-to GHCR.
-
-Two things it guards, both of which produce a release that looks fine and breaks on the
-machine that installs it:
-
-- **The two version sites must agree.** The agent reports `app/client.py`'s value, and the
-  backend compares it against `ZIDANE_AGENT_RELEASE_VERSION` to decide whether to offer an
-  upgrade. If they drift, the fleet upgrades in a loop, forever chasing a version it never
-  claims to reach. `tests/test_version.py` checks this in `make check` too.
-- **The tarball is built from `HEAD`.** An uncommitted bump would ship the old code under
-  the new filename, so the script verifies the built archive really carries the version.
-
-The tarball is deliberately **flat** — `app/`, `pyproject.toml` at the top level, no
-directory prefix — because both `app/updater.py` and `install.sh` unpack it without
-stripping components.
-
-After publishing, set the three values it prints on the backend and restart it; that is
-what turns on one-click self-upgrade for the fleet.
-
-## Quick start (from a checkout)
-
-```bash
-uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python -e ".[dev]"
-cp conf/config.example.ini conf/config.ini    # then set backend.wss_url + api_key
-./.venv/bin/python -m app.main --config conf/config.ini
-```
-
-Get an `api_key` from the backend: **Settings → User tokens → Create**, or
-`POST /api/v1/user-tokens`. It is shown once.
+`zidane-agent` is an autonomous Node.js service embedding the
+[Pi coding-agent SDK](https://pi.dev/docs/latest/sdk). Zidane Server sends prompts and
+desired state; the agent selects the configured model, runs each conversation in an
+isolated workspace, invokes tools and skills, and streams events and final responses
+back. Capacity controls how many Pi sessions may run concurrently.
 
 ## Configuration
 
-See `conf/config.example.ini`. The essentials:
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ZIDANE_AGENT_SERVER_URL` | required | `wss://.../ws/agent` endpoint |
+| `ZIDANE_AGENT_API_KEY` | required | Registration key shown once by the server |
+| `ZIDANE_AGENT_NAME` | `zidane-agent` | Initial unique name within the user account |
+| `ZIDANE_AGENT_VERSION` | `1.0.0` | Reported version |
+| `ZIDANE_AGENT_DESCRIPTION` | `Autonomous Pi coding agent` | Operator-facing description |
+| `ZIDANE_AGENT_CAPACITY` | `1` | Maximum concurrent Pi sessions |
+| `ZIDANE_AGENT_WORKING_DIRECTORY` | `/var/lib/zidane-agent` | Durable local state root |
+| `ZIDANE_AGENT_ALLOW_INSECURE_WS` | unset | Permit remote plain WebSocket only on a trusted network |
 
-| Key | Meaning |
-|---|---|
-| `agent.name` | Display name in the UI (defaults to the hostname) |
-| `agent.capacity` | Max concurrent tasks. Zidane schedules by **slots**, so 4 means four independent steps run here at once |
-| `agent.labels` | `key=value` pairs. A step lands here only if its selector is satisfied |
-| `backend.wss_url` | e.g. `wss://zidane.example.com:17001/ws/agent` (the backend's default port) |
-| `backend.api_key` | Registration token; swapped for a rotating session token after first connect |
-| `logging.file` | Agent log, relative to the config file (default `logs/agent.log`) |
-| `logging.level` | Default `INFO` |
-| `logging.max_mb` | Rotate past this size (default 50) |
-| `logging.file_count` | Files kept, live one included (default 5) → a 250MB ceiling |
+The bootstrap key is exchanged for a rotating, one-use session credential. The rotated
+credential is stored mode `0600`; the bootstrap key is never written to agent metadata.
+Revoking its server-side registration key invalidates derived sessions.
 
-The agent logs to stdout **and** to that rotating file. Task output is separate: it
-streams to the backend and is not mixed into the agent log.
+## Working directory
 
-`[backend]` is **not** remotely writable. A `SET_CONFIG` push from the backend can change
-capacity, labels and logging, but cannot repoint the agent at a different server.
-
-## Behaviour worth knowing
-
-**It refuses to run as root.** Scripts arriving from a central service should not execute
-with unrestricted privileges by accident. Create a dedicated user, or pass `--allow-root`
-if that is genuinely what you want.
-
-**Secrets are redacted before anything leaves the host.** The backend sends sensitive
-config-map values in a separate `secret_env` field; the agent merges them into the child
-process environment and registers every value in a redaction table applied to both stdout
-and stderr. This is the layer that catches `set -x`, `env`, and a stack trace that happens
-to include a token — by then the value is already in the process's output, and the host is
-the only place left to scrub it. The redactor holds back a tail between reads so a secret
-split across a chunk boundary is still caught.
-
-**Results survive a restart.** Every command is journalled under `state/journal/`. A
-finished result is only dropped once the backend ACKs it, so a result produced while the
-connection was down is replayed via `RESUME` on reconnect. A command that was *running*
-when the process died is reported `LOST` rather than left for the backend to time out.
-
-**Markers are parsed here, not server-side.** `@zidane:set`, `@zidane:notify`,
-`@zidane:progress` and `@zidane:artifact` are harvested from stdout as it streams and sent
-structured in `COMMAND_DONE`. The marker line is still written to the log verbatim, so the
-run stays auditable.
-
-**Kills reach the whole process tree.** Tasks run in a new session; a KILL or timeout
-sends SIGTERM to the process group, then SIGKILL after the grace period, so a script that
-backgrounds work does not leave orphans.
-
-## Layout
-
-```
-app/
-  main.py        CLI entry point, logging, signal handling, root check
-  config.py      config.ini loading + validated remote updates
-  client.py      the WebSocket client: register, resume, heartbeat, dispatch
-  runner.py      script execution, streaming, markers, timeout, kill
-  journal.py     durable command journal
-  redaction.py   boundary-safe secret scrubbing
+```text
+agent.json       server-managed name, version, description, and capacity
+SOUL.md          personality and operating constraints
+skills/          Pi SKILL.md files and supporting resources
+memory/          bounded, searchable, TTL-aware durable memories
+knowledge/       connector definitions, local chunks, and citation index
+config/          agent-owned config maps, effective config, LLM profiles, and custom models
+secrets/         rotating/Pi credentials plus agent-owned write-only secrets (mode 0600)
+sessions/        redacted Pi event transcripts
+workspaces/      one isolated working directory per conversation
+exports/         portable tar.gz archives
+logs/            rotated, redacted JSON logs
 ```
 
-## Ports
+Memory rejects recognizable credentials, supports normal/private/restricted sensitivity,
+and is capped at 10,000 active records. Built-in Pi tools let the agent remember,
+retrieve, forget, and search its cited knowledge index. Supported knowledge connectors
+are GitHub, Notion, Confluence, and generic HTTP(S). Model profiles support Pi providers
+such as OpenAI, Anthropic, and DeepSeek, plus compatible custom endpoints.
 
-The agent **listens on nothing** — it dials out to the backend on **17001**, which is why a
-host behind NAT or a firewall needs no inbound rules. **17002** is reserved for the loopback
-REST API a local script will call to read or update its `machine_version`; that API is not
-implemented yet, and the port is recorded in `conf/config.example.ini` so nothing else in the
-project claims it.
+The Models page follows Pi's login sequence: choose a provider, choose one of the
+authentication methods that provider advertises, complete any device-code/OAuth prompts,
+and only then choose a model. Pi persists provider credentials locally in
+`secrets/pi-auth.json`; OAuth tokens are never returned to Zidane Server or Web. API-key
+login consumes an encrypted Zidane Secret and stores the resulting Pi credential locally.
 
-## Not yet implemented
+Valid shell-style config-map keys are applied to the agent process environment; keys with
+dots or dashes remain available in `config/applied.json`. General synchronized secrets
+are isolated under `secrets/synced/`, whose path is exposed as
+`ZIDANE_AGENT_SYNCED_SECRETS_DIR`, so they cannot overwrite registration or model
+credentials.
 
-- **Self-upgrade.** The download / verify / versioned-install / symlink-flip / rollback
-  sequence is specified in the backend's `docs/design/07-scaling-ops.md` §8. Until it
-  lands the agent replies `UPGRADE_SKIPPED` to an upgrade push rather than silently doing
-  nothing.
-- **Installers** (`install.sh`, `install.ps1`, container image) and OS service units.
-- **Container isolation** for tasks (per-org opt-in cgroup/container limits).
+The agent advertises its versioned local-storage capability at registration. Zidane Web
+can list and CRUD every local `SKILL.md`, named config map, and write-only secret through
+synchronous WebSocket requests. Importing account config maps or encrypted account
+secrets creates agent-local copies; subsequent account changes do not affect those copies
+until they are imported again. Secret values are never returned by the agent.
+
+## Run and test
+
+Node.js 22 or newer is required.
+
+```bash
+npm ci
+export ZIDANE_AGENT_SERVER_URL=wss://zidane.example.com/ws/agent
+export ZIDANE_AGENT_API_KEY=zidane_registration_key
+export ZIDANE_AGENT_NAME=research-01
+export ZIDANE_AGENT_CAPACITY=4
+npm start
+```
+
+```bash
+npm run check
+npm test
+npm audit --audit-level=high
+```
+
+## Installation
+
+The container uses Ubuntu 24.04, installs Node.js 22 and common coding tools, runs as the
+unprivileged `zidane` user, and persists `/var/lib/zidane-agent`:
+
+```bash
+docker build -t zidane-agent .
+docker run --restart unless-stopped \
+  -e ZIDANE_AGENT_SERVER_URL=wss://zidane.example.com/ws/agent \
+  -e ZIDANE_AGENT_API_KEY=zidane_registration_key \
+  -v zidane-agent-data:/var/lib/zidane-agent \
+  zidane-agent
+```
+
+Host installers expect the source/release bundle, Node.js 22+, a registration key, and a
+server URL:
+
+- Linux/systemd: run `scripts/install-linux.sh` as root with the environment variables
+  set. Code goes to `/opt/zidane-agent`; state goes to `/var/lib/zidane-agent`.
+- macOS/launchd: run `scripts/install-macos.sh` as the target user. It installs a user
+  LaunchAgent under `~/Library`.
+- Windows/WinSW: run `scripts/install-windows.ps1 -ServerUrl ... -ApiKey ...
+  -WinSWPath ...` in an elevated PowerShell. State is ACL-protected under ProgramData.
+
+## Portable transfer
+
+Exports contain `agent.json`, `SOUL.md`, skills, memory, knowledge, and non-secret config.
+Secrets, rotating credentials, sessions, workspaces, logs, and existing exports are never
+included. Imports validate paths and SHA-256 checksums before supporting `validate`,
+`merge`, or `replace` mode. See [the archive format](../docs/export-format.md).
