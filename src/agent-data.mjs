@@ -338,6 +338,24 @@ export class AgentDataStore {
     return target;
   }
 
+  /** Replace every null with the value already stored under `name`. */
+  async #resolveKeptValues(name, values) {
+    const directory = this.#secretDirectory(name);
+    const resolved = {};
+    for (const [key, value] of Object.entries(values)) {
+      if (value !== null) {
+        resolved[key] = value;
+        continue;
+      }
+      try {
+        resolved[key] = await readFile(resolve(directory, key), "utf8");
+      } catch {
+        throw new Error(`there is no stored value to keep for ${key}`);
+      }
+    }
+    return resolved;
+  }
+
   /** Write every key and drop the ones this revision no longer carries. */
   async #writeSecretEntries(name, values) {
     const directory = this.#secretDirectory(name);
@@ -375,7 +393,10 @@ export class AgentDataStore {
     if (!item) throw new Error("secret not found");
     const name = validSecretName(input.name);
     if (items.some((candidate) => candidate.id !== secretId && candidate.name === name)) throw new Error("an agent secret with this name already exists");
-    const values = validSecretValues(input.values);
+    const values = await this.#resolveKeptValues(
+      item.name,
+      validSecretValues(input.values, { allowKept: true }),
+    );
     const oldName = item.name;
     await this.#writeSecretEntries(name, values);
     item.name = name;
@@ -587,7 +608,8 @@ function validSecretName(value) {
   return name;
 }
 
-function validSecretValues(value) {
+/** With `allowKept`, a null value survives as null and means "keep what is stored". */
+function validSecretValues(value, { allowKept = false } = {}) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("secret values must be a key/value map");
   const entries = Object.entries(value);
   if (!entries.length) throw new Error("a secret needs at least one key");
@@ -596,6 +618,10 @@ function validSecretValues(value) {
   let size = 0;
   for (const [key, item] of entries) {
     if (!SAFE_KEY.test(key) || key.length > 120) throw new Error(`unsafe secret key: ${key}`);
+    if (allowKept && item === null) {
+      clean[key] = null;
+      continue;
+    }
     const secret = String(item ?? "");
     size += Buffer.byteLength(secret);
     if (!secret || size > MAX_VALUE_BYTES) throw new Error("secret values must contain 1 to 1000000 bytes");

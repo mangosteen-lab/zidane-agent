@@ -85,13 +85,35 @@ test("agent-owned skills, config maps, and secrets support local CRUD and accoun
     assert.equal(importedSecrets[0].source.scope, "account");
     assert.deepEqual(importedSecrets[0].keys, ["token"]);
     assert.doesNotMatch(JSON.stringify(await store.handle("secret.list")), /local-secret-value|account-secret-value/);
+    // A null value keeps the stored key file; only a key carrying a value is rewritten.
+    await store.handle("secret.update", {
+      secret_id: localSecret.secret_id,
+      name: "LOCAL_TOKEN",
+      values: { api_key: null, org_id: "org-99" },
+    });
+    assert.equal(await readFile(resolve(local.syncedSecrets, "LOCAL_TOKEN", "api_key"), "utf8"), "local-secret-value");
+    assert.equal(await readFile(resolve(local.syncedSecrets, "LOCAL_TOKEN", "org_id"), "utf8"), "org-99");
+    // A kept value is read from the directory the secret is being renamed away from.
+    await store.handle("secret.update", {
+      secret_id: localSecret.secret_id,
+      name: "KEPT_TOKEN",
+      values: { api_key: null },
+    });
+    assert.equal(await readFile(resolve(local.syncedSecrets, "KEPT_TOKEN", "api_key"), "utf8"), "local-secret-value");
+    await assert.rejects(store.handle("secret.update", {
+      secret_id: localSecret.secret_id,
+      name: "KEPT_TOKEN",
+      values: { api_key: null, missing: null },
+    }), /no stored value to keep for missing/);
+    // Nothing is stored yet on a create, so a null is just a missing value.
+    await assert.rejects(store.handle("secret.create", { name: "NEW_TOKEN", values: { api_key: null } }), /1 to 1000000 bytes/);
     await store.handle("secret.update", {
       secret_id: localSecret.secret_id,
       name: "RENAMED_TOKEN",
       values: { api_key: "replacement-value" },
     });
     assert.equal(await readFile(resolve(local.syncedSecrets, "RENAMED_TOKEN", "api_key"), "utf8"), "replacement-value");
-    // The dropped key goes with the rename; a write replaces the whole map.
+    // An omitted key is dropped, and the directory goes with the rename.
     await assert.rejects(readFile(resolve(local.syncedSecrets, "RENAMED_TOKEN", "org_id")), { code: "ENOENT" });
     await assert.rejects(readFile(resolve(local.syncedSecrets, "LOCAL_TOKEN", "api_key")), { code: "ENOENT" });
     await assert.rejects(store.handle("secret.create", { name: "EMPTY", values: {} }), /at least one key/);
