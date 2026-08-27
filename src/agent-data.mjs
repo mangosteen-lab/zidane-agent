@@ -46,7 +46,7 @@ export class AgentDataStore {
     if (operation === "llm.update") return { item: await this.#updateProfile(input) };
     if (operation === "llm.delete") return { deleted: await this.#deleteProfile(input.profile_id) };
     if (operation === "llm.select") return { item: await this.#selectProfile(input.profile_id) };
-    if (operation === "cron.list") return this.#cron().store.list();
+    if (operation === "cron.list") return this.#cron().list();
     if (operation === "cron.create") return { item: await this.#cron().store.create(input) };
     if (operation === "cron.update") return { item: await this.#cron().store.update(input) };
     if (operation === "cron.delete") return { deleted: await this.#cron().store.delete(input.task_id) };

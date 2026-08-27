@@ -330,6 +330,23 @@ export class CronScheduler {
   get active() { return this.#running.size; }
   get queued() { return this.#queue.length; }
 
+  /**
+   * The task list, annotated with what the lane is doing right now.
+   *
+   * A run reports itself only through history, which lands when it is over. Without this
+   * a task triggered by hand looks inert for however long it takes.
+   */
+  async list() {
+    const { items } = await this.store.list();
+    return {
+      items: items.map((task) => ({
+        ...task,
+        running: this.#running.has(task.id),
+        waiting: this.#queue.some((item) => item.id === task.id),
+      })),
+    };
+  }
+
   start() {
     if (this.#timer) return;
     this.#timer = setInterval(() => {

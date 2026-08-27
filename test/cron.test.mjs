@@ -116,6 +116,12 @@ test("the scheduler bounds its own lane and queues the rest", async () => {
     assert.equal(scheduler.active, 2);
     assert.equal(scheduler.queued, 1);
 
+    // A run reports itself only through history, which lands when it is over, so the
+    // list carries what the lane is doing right now.
+    const inFlight = (await scheduler.list()).items;
+    assert.deepEqual(inFlight.map((item) => item.running), [true, true, false]);
+    assert.deepEqual(inFlight.map((item) => item.waiting), [false, false, true]);
+
     gates.get(tasks[0].id)();
     await settle();
     // The freed slot goes to the task that has been waiting longest.
@@ -149,6 +155,8 @@ test("the scheduler bounds its own lane and queues the rest", async () => {
     // Running on demand ignores the schedule, but not the lane.
     assert.deepEqual(await scheduler.runNow(broken.id), { started: true, queued: false });
     await assert.rejects(scheduler.runNow("no-such-task"), /no such scheduled task/);
+    // runNow answers before the run ends, so let the lane settle before the directory goes.
+    await idle(scheduler);
     assert.match(taskPrompt({ name: "x", schedule: "* * * * *" }), /Schedule: \* \* \* \* \* \(UTC\)/);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -225,3 +233,8 @@ test("a scheduled task is staged with only the skills it names", async () => {
 
 /** Let the scheduler's own await of `store.due()` resolve before inspecting it. */
 function settle() { return new Promise((done) => setTimeout(done, 10)); }
+
+/** Wait for the lane to empty. A run outlives the call that started it. */
+async function idle(scheduler) {
+  for (let attempt = 0; attempt < 200 && (scheduler.active || scheduler.queued); attempt += 1) await settle();
+}
