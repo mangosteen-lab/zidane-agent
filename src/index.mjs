@@ -113,11 +113,34 @@ async function handleMessage(message) {
   if (message.type === "PROMPT") {
     try {
       runtime.prompt(message);
-    } catch {
+    } catch (error) {
       send("BUSY", {
         delivery_id: message.delivery_id,
         conversation_id: message.conversation_id,
+        // `conversation` means wait for this thread; `capacity` means wait for a slot.
+        reason: error?.reason ?? "capacity",
       });
+    }
+    return;
+  }
+  if (message.type === "COMPACT_THREAD") {
+    try {
+      const result = await runtime.compact(message.conversation_id);
+      send("THREAD_COMPACTED", { conversation_id: message.conversation_id, ...result });
+      logger.log("info", "thread compacted", { conversation_id: message.conversation_id, memory_id: result.memory_id });
+    } catch (error) {
+      // Left live on purpose: the control plane retries rather than losing the thread.
+      send("THREAD_COMPACT_FAILED", { conversation_id: message.conversation_id, error: String(error) });
+      logger.log("error", "thread compaction failed", { conversation_id: message.conversation_id, error: String(error) });
+    }
+    return;
+  }
+  if (message.type === "DELETE_THREAD") {
+    try {
+      await runtime.discard(message.conversation_id);
+      send("THREAD_DELETED", { conversation_id: message.conversation_id });
+    } catch (error) {
+      send("THREAD_DELETE_FAILED", { conversation_id: message.conversation_id, error: String(error) });
     }
     return;
   }

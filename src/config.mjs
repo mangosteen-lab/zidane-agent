@@ -6,7 +6,7 @@ const DEFAULT_WORKDIR = "/var/lib/zidane-agent";
 
 export function configFromEnv(env = process.env) {
   const workingDirectory = resolve(env.ZIDANE_AGENT_WORKING_DIRECTORY ?? DEFAULT_WORKDIR);
-  const capacity = Number.parseInt(env.ZIDANE_AGENT_CAPACITY ?? "1", 10);
+  const capacity = Number.parseInt(env.ZIDANE_AGENT_CAPACITY ?? "5", 10);
   if (!Number.isInteger(capacity) || capacity < 1) throw new Error("ZIDANE_AGENT_CAPACITY must be >= 1");
   const apiKey = env.ZIDANE_AGENT_API_KEY ?? "";
   const serverUrl = env.ZIDANE_AGENT_SERVER_URL ?? "";
