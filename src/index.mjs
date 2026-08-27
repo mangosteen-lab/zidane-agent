@@ -1,4 +1,4 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, statfs, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { resolve } from "node:path";
 import process from "node:process";
@@ -12,8 +12,10 @@ import {
   configFromEnv,
   initialise,
   readSessionToken,
+  resolveLlmProfile,
   writeSessionToken,
 } from "./config.mjs";
+import { DailyJournal } from "./daily.mjs";
 import { KnowledgeStore } from "./knowledge.mjs";
 import { AgentLogger } from "./logger.mjs";
 import { PiAuthManager } from "./llm-auth.mjs";
@@ -56,7 +58,8 @@ logger.log("info", "agent storage ready", {
   config_maps: process.env.AI_AGENT_CONFIG_MAPS_FOLDER,
 });
 const memory = new MemoryStore(local);
-const runtime = new PiRuntime(config, local, send, logger, memory);
+const journal = new DailyJournal(local, logger);
+const runtime = new PiRuntime(config, local, send, logger, memory, journal);
 const knowledge = new KnowledgeStore(local, logger);
 const llmAuth = new PiAuthManager(local, send, logger);
 const agentData = new AgentDataStore(local, knowledge);
@@ -68,9 +71,77 @@ try {
 }
 await knowledge.start();
 
-function telemetry() {
+// The day's work is summarised into memory once the day is over. Checked on a slow
+// timer rather than scheduled for an hour: an agent that was asleep at midnight, or
+// restarted, still catches up on the next tick.
+const digestEvery = Math.max(60, Number.parseInt(process.env.ZIDANE_AGENT_DIGEST_INTERVAL_SECONDS ?? "900", 10) || 900);
+const digestEnabled = (process.env.ZIDANE_AGENT_DAILY_DIGEST ?? "true") !== "false";
+const digestTimer = digestEnabled
+  ? setInterval(() => {
+      void journal.digest(runtime, memory).catch((error) => {
+        // Being at capacity is the ordinary case, not a fault: try again later.
+        if (error?.reason !== "capacity" && error?.reason !== "conversation") {
+          logger.log("warning", "daily digest failed", { error: String(error) });
+        }
+      });
+    }, digestEvery * 1_000)
+  : null;
+digestTimer?.unref();
+
+let lastCpu = process.cpuUsage();
+let lastCpuAt = process.hrtime.bigint();
+
+/**
+ * How much memory this agent may actually use.
+ *
+ * `os.totalmem()` reports the host, which in a container is not the limit the agent
+ * will be killed for exceeding. The cgroup knows better when there is one.
+ */
+async function memoryLimit() {
+  for (const path of ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"]) {
+    try {
+      const raw = (await readFile(path, "utf8")).trim();
+      const value = Number(raw);
+      // cgroup v2 writes "max" when unlimited, v1 writes an absurd sentinel.
+      if (Number.isFinite(value) && value > 0 && value < os.totalmem()) return value;
+    } catch { /* not cgroup-managed, or not readable */ }
+  }
+  return os.totalmem();
+}
+
+/**
+ * What the console shows about this agent.
+ *
+ * CPU is a share of one core over the interval since the last sample, because a
+ * cumulative counter means nothing to a reader. Disk is the filesystem holding the
+ * working directory — the thing that actually fills up with sessions and workspaces.
+ */
+async function telemetry() {
   const memory = process.memoryUsage();
   const cpu = process.cpuUsage();
+  const at = process.hrtime.bigint();
+  const elapsed = Number(at - lastCpuAt) / 1_000;
+  const spent = cpu.user - lastCpu.user + (cpu.system - lastCpu.system);
+  lastCpu = cpu;
+  lastCpuAt = at;
+
+  let disk = {};
+  try {
+    const stats = await statfs(local.root);
+    const total = Number(stats.blocks) * Number(stats.bsize);
+    disk = {
+      disk_total_bytes: total,
+      // `bavail` is what this user may actually use, which is what matters here.
+      disk_used_bytes: total - Number(stats.bavail) * Number(stats.bsize),
+    };
+  } catch { /* not every filesystem answers statfs */ }
+
+  let llm = null;
+  try {
+    const profile = await resolveLlmProfile(local, "");
+    if (profile.provider) llm = { name: profile.name ?? null, provider: profile.provider, model: profile.model };
+  } catch { /* no profile selected yet */ }
+
   return {
     capacity_used: runtime.active,
     capacity: config.capacity,
@@ -81,7 +152,11 @@ function telemetry() {
     external_bytes: memory.external,
     cpu_user_micros: cpu.user,
     cpu_system_micros: cpu.system,
+    cpu_percent: elapsed > 0 ? Math.min(100, Math.round((spent / elapsed) * 1_000) / 10) : 0,
+    memory_total_bytes: await memoryLimit(),
     load_average: os.loadavg(),
+    llm,
+    ...disk,
   };
 }
 
@@ -107,7 +182,7 @@ async function handleMessage(message) {
     return;
   }
   if (message.type === "PING") {
-    send("PONG", { ping_sent_at: message.sent_at, ...telemetry() });
+    send("PONG", { ping_sent_at: message.sent_at, ...(await telemetry()) });
     return;
   }
   if (message.type === "PROMPT") {
@@ -389,6 +464,7 @@ async function connect() {
 
 function shutdown(signal) {
   stopped = true;
+  if (digestTimer) clearInterval(digestTimer);
   logger.log("info", "agent stopping", { signal });
   socket?.close(1001, "service stopping");
 }

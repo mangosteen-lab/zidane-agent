@@ -23,7 +23,10 @@ export class PiRuntime {
   // so two concurrent runs would open two Pi sessions over one workspace and one
   // session history — they would interleave and corrupt each other.
   #running = new Set();
-  constructor(config, local, emit, logger, memory) { this.config = config; this.local = local; this.emit = emit; this.logger = logger; this.memory = memory; }
+  constructor(config, local, emit, logger, memory, journal) {
+    this.config = config; this.local = local; this.emit = emit;
+    this.logger = logger; this.memory = memory; this.journal = journal;
+  }
   get active() { return this.#active.size; }
   /** In-flight runs, so a caller can wait for the runtime to settle. */
   get activeTasks() { return [...this.#active.values()].map((entry) => entry.task).filter(Boolean); }
@@ -56,6 +59,33 @@ export class PiRuntime {
    * was worth keeping. A failure leaves everything in place: the control plane retries
    * on the next sweep rather than losing the thread.
    */
+  /**
+   * Run one prompt and return only its text.
+   *
+   * Occupies a slot like any other run, so a summary cannot outrun the capacity the
+   * agent advertises.
+   */
+  async summarise(conversationId, prompt) {
+    const conversation = safeName(conversationId);
+    if (this.#running.has(conversation)) throw new BusyError("conversation");
+    if (this.active >= this.config.capacity) throw new BusyError("capacity");
+    this.#running.add(conversation);
+    try {
+      const workspace = resolve(this.local.workspaces, conversation);
+      const { session } = await this.#session(conversation, workspace, {});
+      let text = "";
+      session.subscribe((event) => {
+        if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
+          text += event.assistantMessageEvent.delta;
+        }
+      });
+      await session.prompt(prompt);
+      return text.trim().slice(0, 10_000);
+    } finally {
+      this.#running.delete(conversation);
+    }
+  }
+
   async compact(conversationId) {
     const conversation = safeName(conversationId);
     if (this.#running.has(conversation)) throw new BusyError("conversation");
@@ -159,6 +189,12 @@ export class PiRuntime {
     try {
       await session.prompt(delivery.text);
       await writeFile(resolve(this.local.sessions, `${conversation}.json`), JSON.stringify(transcript));
+      await this.journal?.record({
+        conversation: delivery.conversation_id ?? conversation,
+        prompt: delivery.text,
+        answer: responseText,
+        status: entry.cancelled ? "cancelled" : "completed",
+      });
       this.emit("PROMPT_DONE", { delivery_id: delivery.delivery_id, conversation_id: delivery.conversation_id, status: entry.cancelled ? "cancelled" : "completed", final_text: responseText.slice(0, 100_000) });
       this.logger?.log("info", "prompt finished", { delivery_id: delivery.delivery_id, conversation_id: delivery.conversation_id, status: entry.cancelled ? "cancelled" : "completed" });
     } catch (error) {
