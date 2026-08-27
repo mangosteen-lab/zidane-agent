@@ -91,27 +91,38 @@ test("a schedule fires once in its minute, is never made up after downtime, and 
   }
 });
 
-test("the scheduler bounds its own lane and records what each run did", async () => {
+test("the scheduler bounds its own lane and queues the rest", async () => {
   const root = await mkdtemp(resolve(tmpdir(), "zidane-cron-run-test-"));
   try {
     const store = new CronStore({ crontab: resolve(root, "crontab") });
     const started = [];
-    let release;
-    const gate = new Promise((settle) => { release = settle; });
+    const gates = new Map();
     const runtime = {
-      runTask(input) { started.push(input); return gate.then(() => "did the thing"); },
+      runTask(input) {
+        started.push(input);
+        return new Promise((finish) => gates.set(input.id, () => finish("did the thing")));
+      },
     };
     const scheduler = new CronScheduler(store, runtime, null, { limit: 2 });
 
+    const tasks = [];
     for (const name of ["one", "two", "three"]) {
-      await store.create({ name, description: `${name} runs`, schedule: "0 2 * * *", skills: ["ops"] });
+      tasks.push(await store.create({ name, description: `${name} runs`, schedule: "0 2 * * *", skills: ["ops"] }));
     }
     const running = scheduler.tick(Date.parse("2026-08-27T02:00:00Z"));
     await settle();
-    // Two of the three start; the third is dropped rather than queued — its next firing is the retry.
-    assert.equal(started.length, 2);
+    // Two of the three start; the third waits for a slot rather than losing its firing.
+    assert.deepEqual(started.map((item) => item.id), [tasks[0].id, tasks[1].id]);
     assert.equal(scheduler.active, 2);
-    release();
+    assert.equal(scheduler.queued, 1);
+
+    gates.get(tasks[0].id)();
+    await settle();
+    // The freed slot goes to the task that has been waiting longest.
+    assert.deepEqual(started.map((item) => item.id), [tasks[0].id, tasks[1].id, tasks[2].id]);
+    assert.equal(scheduler.queued, 0);
+    for (const release of gates.values()) release();
+    // The tick resolves only once the queued work has run too.
     await running;
     assert.equal(scheduler.active, 0);
 
@@ -121,7 +132,7 @@ test("the scheduler bounds its own lane and records what each run did", async ()
     assert.deepEqual(started[0].skills, ["ops"]);
 
     const ran = (await store.list()).items.filter((item) => item.last_success);
-    assert.equal(ran.length, 2);
+    assert.equal(ran.length, 3);
     assert.equal(ran[0].last_success.output, "did the thing");
     assert.equal(ran[0].last_success.status, "success");
     assert.equal(ran[0].last_failure, null);
@@ -136,9 +147,57 @@ test("the scheduler bounds its own lane and records what each run did", async ()
     assert.match(after.last_failure.error, /the task blew up/);
 
     // Running on demand ignores the schedule, but not the lane.
-    assert.equal(await scheduler.start(broken.id), true);
-    await assert.rejects(scheduler.start("no-such-task"), /no such scheduled task/);
+    assert.deepEqual(await scheduler.runNow(broken.id), { started: true, queued: false });
+    await assert.rejects(scheduler.runNow("no-such-task"), /no such scheduled task/);
     assert.match(taskPrompt({ name: "x", schedule: "* * * * *" }), /Schedule: \* \* \* \* \* \(UTC\)/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a queued task is honoured as it stands when its slot comes, and never stacks up", async () => {
+  const root = await mkdtemp(resolve(tmpdir(), "zidane-cron-queue-test-"));
+  try {
+    const store = new CronStore({ crontab: resolve(root, "crontab") });
+    const started = [];
+    const gates = new Map();
+    const runtime = {
+      runTask(input) {
+        started.push(input.id);
+        return new Promise((finish) => gates.set(input.id, () => finish("done")));
+      },
+    };
+    const scheduler = new CronScheduler(store, runtime, null, { limit: 1 });
+    const blocker = await store.create({ name: "blocker", schedule: "* * * * *", skills: [] });
+    const waiter = await store.create({ name: "waiter", schedule: "* * * * *", skills: [] });
+
+    const first = scheduler.tick(Date.parse("2026-08-27T02:00:00Z"));
+    await settle();
+    assert.deepEqual(started, [blocker.id]);
+    assert.equal(scheduler.queued, 1);
+
+    // A firing that arrives while the same task is still pending is not stacked on top.
+    void scheduler.tick(Date.parse("2026-08-27T02:01:00Z"));
+    await settle();
+    assert.equal(scheduler.queued, 1);
+
+    // Paused while it waited: the version that runs is the one that stands now.
+    await store.update({ task_id: waiter.id, enabled: false });
+    gates.get(blocker.id)();
+    await first;
+    assert.deepEqual(started, [blocker.id]);
+    assert.equal(scheduler.queued, 0);
+    assert.equal((await store.get(waiter.id)).last_success, null);
+
+    // A full queue is the one case where a firing is still dropped.
+    const small = new CronScheduler(store, { runTask: () => new Promise(() => {}) }, null, { limit: 1, queueLimit: 1 });
+    await store.update({ task_id: waiter.id, enabled: true });
+    const third = await store.create({ name: "third", schedule: "* * * * *", skills: [] });
+    void small.tick(Date.parse("2026-08-27T02:02:00Z"));
+    await settle();
+    assert.equal(small.active, 1);
+    assert.equal(small.queued, 1);
+    assert.equal((await store.get(third.id)).last_success, null);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

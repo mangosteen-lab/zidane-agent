@@ -307,11 +307,15 @@ export function taskPrompt(task) {
  *
  * Scheduled runs are deliberately outside `config.capacity` — a nightly job must not be
  * refused because someone is chatting — but they get a bound of their own so ten tasks
- * sharing a midnight schedule cannot open ten Pi sessions at once. Work over the bound is
- * dropped for this minute rather than queued: the next firing is the retry.
+ * sharing a midnight schedule cannot open ten Pi sessions at once. Work over the bound
+ * waits its turn rather than being dropped: a daily task that lost its slot would
+ * otherwise lose the whole day.
  */
 export class CronScheduler {
   #running = new Set();
+  // Tasks waiting for a slot, oldest first. One entry per task: a schedule that fires
+  // faster than it runs must not stack up copies of itself.
+  #queue = [];
   #timer = null;
 
   constructor(store, runtime, logger, options = {}) {
@@ -319,10 +323,12 @@ export class CronScheduler {
     this.runtime = runtime;
     this.logger = logger;
     this.limit = Math.max(1, Number(options.limit) || 3);
+    this.queueLimit = Math.max(1, Number(options.queueLimit) || 100);
     this.intervalMs = Math.max(5_000, Number(options.intervalMs) || 30_000);
   }
 
   get active() { return this.#running.size; }
+  get queued() { return this.#queue.length; }
 
   start() {
     if (this.#timer) return;
@@ -337,37 +343,86 @@ export class CronScheduler {
     this.#timer = null;
   }
 
+  /**
+   * Submit everything the schedule names for this minute.
+   *
+   * Resolves once all of it has run, queue time included, so a caller can wait for the
+   * tick to settle rather than guess at it.
+   */
   async tick(now = Date.now()) {
     const due = await this.store.due(now);
-    const started = [];
-    for (const task of due) {
-      if (this.#running.has(task.id)) continue;
-      if (this.#running.size >= this.limit) {
-        this.logger?.log("warning", "scheduled task skipped: the cron lane is full", { task_id: task.id, name: task.name, limit: this.limit });
-        continue;
-      }
-      started.push(this.run(task));
-    }
-    return Promise.all(started);
+    return Promise.all(due.map((task) => this.#submit(task)).filter(Boolean));
   }
 
   /**
    * Run one task now, whatever its schedule says.
    *
-   * Returns as soon as the run has started. A task can take minutes, and the caller is a
-   * 15-second RPC from the control plane: the result belongs in the history, not the reply.
+   * Returns as soon as the run has started, or been queued behind one. A task can take
+   * minutes, and the caller is a 15-second RPC from the control plane: the result belongs
+   * in the history, not in the reply.
    */
-  async start(taskId) {
+  async runNow(taskId) {
     const task = await this.store.get(taskId);
     if (!task) throw new Error("no such scheduled task");
-    if (this.#running.has(task.id)) throw new Error("this task is already running");
-    if (this.#running.size >= this.limit) throw new Error("the cron lane is full");
-    void this.run(task);
-    return true;
+    const queued = this.#running.size >= this.limit;
+    const pending = this.#submit(task);
+    if (!pending) throw new Error("this task is already running or waiting for a slot");
+    void pending;
+    return { started: !queued, queued };
   }
 
-  async run(task) {
-    this.#running.add(task.id);
+  /** Join the queue, then take a slot if one is free. Null if it is already pending. */
+  #submit(task) {
+    if (this.#running.has(task.id) || this.#queue.some((item) => item.id === task.id)) {
+      this.logger?.log("info", "scheduled task is still running from its last firing", { task_id: task.id, name: task.name });
+      return null;
+    }
+    if (this.#queue.length >= this.queueLimit) {
+      this.logger?.log("warning", "scheduled task dropped: the cron queue is full", { task_id: task.id, name: task.name, queue_limit: this.queueLimit });
+      return null;
+    }
+    const waiting = new Promise((settle) => this.#queue.push({ id: task.id, name: task.name, settle }));
+    this.#drain();
+    return waiting;
+  }
+
+  #drain() {
+    while (this.#queue.length && this.#running.size < this.limit) {
+      const item = this.#queue.shift();
+      // Reserved before the first await, or the whole queue would claim the same slot.
+      this.#running.add(item.id);
+      void this.#dispatch(item);
+    }
+  }
+
+  async #dispatch(item) {
+    let result = null;
+    try { result = await this.run(item.id); }
+    catch (error) { this.logger?.log("error", "scheduled task could not be started", { task_id: item.id, name: item.name, error: String(error) }); }
+    finally {
+      this.#running.delete(item.id);
+      item.settle(result);
+      this.#drain();
+    }
+  }
+
+  /**
+   * Execute one task and record what happened.
+   *
+   * The task is re-read rather than taken from the queue entry: it may have been edited,
+   * paused, or deleted while it waited, and the version that runs should be the one that
+   * stands now.
+   */
+  async run(taskId) {
+    const task = await this.store.get(taskId);
+    if (!task || !task.enabled) {
+      this.logger?.log("info", "scheduled task skipped: it was removed or paused while it waited", { task_id: taskId });
+      return null;
+    }
+    if (task.ends_at && Date.now() > task.ends_at) {
+      this.logger?.log("info", "scheduled task skipped: its window closed while it waited", { task_id: task.id, name: task.name });
+      return null;
+    }
     const started_at = Date.now();
     this.logger?.log("info", "scheduled task started", { task_id: task.id, name: task.name });
     try {
@@ -379,8 +434,6 @@ export class CronScheduler {
       const entry = await this.store.record(task.id, { started_at, finished_at: Date.now(), status: "error", error: String(error) });
       this.logger?.log("error", "scheduled task failed", { task_id: task.id, name: task.name, error: String(error) });
       return entry;
-    } finally {
-      this.#running.delete(task.id);
     }
   }
 }
