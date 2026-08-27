@@ -4,6 +4,7 @@ import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager
 import { discoverSkills } from "./agent-data.mjs";
 import { readSecretValue, resolveLlmProfile } from "./config.mjs";
 import { contextTools } from "./context-tools.mjs";
+import { prepareSandbox, sandboxTools } from "./sandbox.mjs";
 
 const COMPACT_PROMPT = `Summarise this entire conversation as a durable note for your future self.
 Capture the decisions reached, the constraints discovered, and anything you would need to
@@ -135,7 +136,7 @@ export class PiRuntime {
    * to every chat surface; the log and the task's history are the only trace. The session
    * and its workspace are destroyed when the run ends, whether it succeeded or not.
    */
-  async runTask({ id, prompt, skills = [] }) {
+  async runTask({ id, prompt, skills = [], onProgress }) {
     const conversation = safeName(`cron-${id}`);
     if (this.#running.has(conversation)) throw new BusyError("conversation");
     this.#running.add(conversation);
@@ -152,6 +153,11 @@ export class PiRuntime {
       session.subscribe((event) => {
         if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
           text += event.assistantMessageEvent.delta;
+          // Reported, never emitted: a caller can watch the run without it reaching a chat.
+          onProgress?.({ text });
+        } else if (event.type.includes("tool")) {
+          const tool = toolLabel(event);
+          if (tool) onProgress?.({ tool });
         }
       });
       await session.prompt(prompt);
@@ -174,6 +180,10 @@ export class PiRuntime {
   /** Everything a prompt needs before it can be sent: workspace, model, session. */
   async #session(conversation, workspace, profile, skillPaths = [this.local.skills]) {
     await mkdir(workspace, { recursive: true });
+    // $HOME and $TMPDIR point inside the workspace, so scratch files die with the
+    // conversation instead of piling up in the container or reaching the agent's own
+    // state. A skill that says to write to ~/ still lands here.
+    const sandbox = await prepareSandbox(workspace);
     const runtime = await ModelRuntime.create({ authPath: resolve(this.local.auth, "pi-auth.json"), modelsPath: resolve(this.local.config, "models.json") });
     if (profile.provider && profile.secret_value) {
       await runtime.setRuntimeApiKey(profile.provider, readSecretValue(profile.secret_value));
@@ -197,7 +207,8 @@ export class PiRuntime {
       modelRuntime: runtime,
       resourceLoader: loader,
       tools: profile.tools?.length ? profile.tools : ["read", "grep", "find", "ls", "write", "edit", "bash", "remember", "retrieve_memory", "forget_memory", "search_knowledge"],
-      customTools: contextTools(this.local, this.memory),
+      // The sandboxed bash/write/edit shadow Pi's built-ins of the same name.
+      customTools: [...sandboxTools(workspace, sandbox), ...contextTools(this.local, this.memory)],
     });
   }
 
@@ -255,6 +266,12 @@ export async function stageSkills(root, names, destination) {
   }
   if (!copied.length) throw new Error(`none of the task's skills are installed on this agent: ${names.join(", ")}`);
   return copied;
+}
+
+/** A tool event's name, whichever shape Pi reports it in. */
+function toolLabel(event) {
+  const name = event.toolName ?? event.tool?.name ?? event.toolCall?.name ?? event.name;
+  return typeof name === "string" && name.length <= 60 ? name : null;
 }
 
 function safeName(value) { return String(value).replace(/[^a-zA-Z0-9._-]/g, "_"); }

@@ -238,3 +238,44 @@ function settle() { return new Promise((done) => setTimeout(done, 10)); }
 async function idle(scheduler) {
   for (let attempt = 0; attempt < 200 && (scheduler.active || scheduler.queued); attempt += 1) await settle();
 }
+
+test("a running task can be tailed while it works", async () => {
+  const root = await mkdtemp(resolve(tmpdir(), "zidane-cron-progress-test-"));
+  try {
+    const store = new CronStore({ crontab: resolve(root, "crontab") });
+    let report;
+    const runtime = {
+      runTask({ onProgress }) {
+        return new Promise((finish) => { report = { onProgress, finish }; });
+      },
+    };
+    const scheduler = new CronScheduler(store, runtime, null, { limit: 1 });
+    const task = await store.create({ name: "long one", schedule: "0 2 * * *", skills: [] });
+
+    // Nothing to see before it starts.
+    assert.deepEqual(scheduler.progress(task.id), {
+      task_id: task.id, running: false, waiting: false, started_at: null, output: "", steps: [],
+    });
+
+    const running = scheduler.tick(Date.parse("2026-08-27T02:00:00Z"));
+    await settle();
+    report.onProgress({ text: "working" });
+    report.onProgress({ tool: "bash" });
+    report.onProgress({ text: "working on it" });
+
+    const live = scheduler.progress(task.id);
+    assert.equal(live.running, true);
+    assert.equal(live.output, "working on it");
+    assert.deepEqual(live.steps.map((step) => step.tool), ["bash"]);
+    assert.ok(live.started_at > 0);
+
+    report.finish("all done");
+    await running;
+    // Once it is over the history is the record; the live buffer is not kept around.
+    assert.equal(scheduler.progress(task.id).output, "");
+    assert.equal(scheduler.progress(task.id).running, false);
+    assert.equal((await store.get(task.id)).last_success.output, "all done");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

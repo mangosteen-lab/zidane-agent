@@ -51,6 +51,7 @@ export class AgentDataStore {
     if (operation === "cron.update") return { item: await this.#cron().store.update(input) };
     if (operation === "cron.delete") return { deleted: await this.#cron().store.delete(input.task_id) };
     if (operation === "cron.run") return this.#cron().runNow(input.task_id);
+    if (operation === "cron.progress") return this.#cron().progress(input.task_id);
     if (operation === "account.refresh") return this.#refreshAccountResources(input);
     throw new Error(`unsupported agent data operation: ${operation}`);
   }

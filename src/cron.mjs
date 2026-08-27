@@ -22,6 +22,9 @@ const FIELDS = [
   { name: "day of week", min: 0, max: 6, names: DAYS, offset: 0 },
 ];
 const MAX_OUTPUT_BYTES = 8_000;
+// What a caller may tail while a task is running, and how many tool steps are kept.
+const MAX_PROGRESS_BYTES = 20_000;
+const MAX_STEPS = 60;
 
 /**
  * Parse a five-field cron expression.
@@ -313,6 +316,9 @@ export function taskPrompt(task) {
  */
 export class CronScheduler {
   #running = new Set();
+  // Live output for runs in flight, so a task triggered by hand can be watched. Dropped
+  // when the run ends: from then on its history is the record.
+  #progress = new Map();
   // Tasks waiting for a slot, oldest first. One entry per task: a schedule that fires
   // faster than it runs must not stack up copies of itself.
   #queue = [];
@@ -336,6 +342,20 @@ export class CronScheduler {
    * A run reports itself only through history, which lands when it is over. Without this
    * a task triggered by hand looks inert for however long it takes.
    */
+  /** What one task is doing right now, for a caller tailing a run it started. */
+  progress(taskId) {
+    const id = String(taskId ?? "");
+    const live = this.#progress.get(id);
+    return {
+      task_id: id,
+      running: this.#running.has(id),
+      waiting: this.#queue.some((item) => item.id === id),
+      started_at: live?.started_at ?? null,
+      output: live?.output ?? "",
+      steps: live?.steps ?? [],
+    };
+  }
+
   async list() {
     const { items } = await this.store.list();
     return {
@@ -441,9 +461,22 @@ export class CronScheduler {
       return null;
     }
     const started_at = Date.now();
+    const live = { started_at, output: "", steps: [] };
+    this.#progress.set(task.id, live);
     this.logger?.log("info", "scheduled task started", { task_id: task.id, name: task.name });
     try {
-      const output = await this.runtime.runTask({ id: task.id, prompt: taskPrompt(task), skills: task.skills ?? [] });
+      const output = await this.runtime.runTask({
+        id: task.id,
+        prompt: taskPrompt(task),
+        skills: task.skills ?? [],
+        onProgress: (update) => {
+          if (typeof update.text === "string") live.output = update.text.slice(-MAX_PROGRESS_BYTES);
+          if (update.tool) {
+            live.steps.push({ at: Date.now(), tool: update.tool });
+            if (live.steps.length > MAX_STEPS) live.steps.shift();
+          }
+        },
+      });
       const entry = await this.store.record(task.id, { started_at, finished_at: Date.now(), status: "success", output });
       this.logger?.log("info", "scheduled task finished", { task_id: task.id, name: task.name, duration_ms: entry.duration_ms });
       return entry;
@@ -451,6 +484,8 @@ export class CronScheduler {
       const entry = await this.store.record(task.id, { started_at, finished_at: Date.now(), status: "error", error: String(error) });
       this.logger?.log("error", "scheduled task failed", { task_id: task.id, name: task.name, error: String(error) });
       return entry;
+    } finally {
+      this.#progress.delete(task.id);
     }
   }
 }
