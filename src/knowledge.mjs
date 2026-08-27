@@ -1,312 +1,176 @@
-import { Buffer } from "node:buffer";
-import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
+/**
+ * Knowledge articles held on the agent, and the index the `search_knowledge` tool reads.
+ *
+ * Articles are authored on the account and synced down; the agent never fetches
+ * anything itself. On disk each article is a directory named by its id, holding one
+ * markdown file and whatever images it references:
+ *
+ *   knowledge/articles/<id>/<Name>.md
+ *   knowledge/articles/<id>/image.png
+ *
+ * The hierarchy lives in each article's `parent_id`, not in the directory layout —
+ * the agent only ever searches, so nesting would buy it nothing. The repository
+ * format that mirrors the tree is the control plane's concern.
+ */
 
-const KINDS = new Set(["github", "notion", "confluence", "http"]);
-const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
+import { chmod, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 
-export class KnowledgeManager {
-  #timers = new Map();
-  #running = new Map();
+const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$/;
+const MAX_CONTENT_BYTES = 1_000_000;
+const MAX_ASSET_BYTES = 5 * 1024 * 1024;
+const CHUNK_STRIDE = 1_300;
+const CHUNK_SIZE = 1_500;
 
-  constructor(local, emit, logger) {
+export class KnowledgeStore {
+  constructor(local, logger) {
     this.local = local;
-    this.emit = emit;
     this.logger = logger;
-    this.connectors = resolve(local.knowledge, "connectors");
-    this.sources = resolve(local.knowledge, "sources");
+    this.articles = resolve(local.knowledge, "articles");
   }
 
   async start() {
-    await mkdir(this.connectors, { recursive: true });
-    await mkdir(this.sources, { recursive: true });
-    for (const name of await readdir(this.connectors)) {
-      if (!name.endsWith(".json")) continue;
-      try {
-        const source = JSON.parse(await readFile(resolve(this.connectors, name), "utf8"));
-        this.#schedule(source);
-      } catch (error) {
-        this.logger.log("warning", "invalid stored knowledge connector", { name, error: String(error) });
-      }
-    }
-  }
-
-  async apply(message) {
-    const source = validateSource(message);
-    const credentialPath = this.#credentialPath(source.source_id);
-    if (message.credential) {
-      await writeFile(credentialPath, String(message.credential), { mode: 0o600 });
-      source.credential_name = `knowledge-${source.source_id}`;
-    } else {
-      await rm(credentialPath, { force: true });
-      source.credential_name = null;
-    }
-    await writeFile(
-      resolve(this.connectors, `${source.source_id}.json`),
-      JSON.stringify(source, null, 2),
-      { mode: 0o600 },
-    );
-    this.#schedule(source);
-    return this.sync(source);
-  }
-
-  async remove(sourceId) {
-    if (!/^[a-zA-Z0-9_-]{1,120}$/.test(sourceId)) throw new Error("unsafe source id");
-    clearInterval(this.#timers.get(sourceId));
-    this.#timers.delete(sourceId);
-    await Promise.all([
-      rm(resolve(this.connectors, `${sourceId}.json`), { force: true }),
-      rm(resolve(this.sources, `${sourceId}.json`), { force: true }),
-      rm(this.#credentialPath(sourceId), { force: true }),
-    ]);
+    await mkdir(this.articles, { recursive: true });
     await this.#rebuildIndex();
   }
 
-  async sync(source) {
-    if (this.#running.has(source.source_id)) return this.#running.get(source.source_id);
-    const task = this.#sync(source).finally(() => this.#running.delete(source.source_id));
-    this.#running.set(source.source_id, task);
-    return task;
+  /** Replace the synced set wholesale: what the account shares is what the agent holds. */
+  async apply(incoming) {
+    const wanted = new Map();
+    for (const raw of Array.isArray(incoming) ? incoming : []) {
+      const article = validArticle(raw);
+      wanted.set(article.id, article);
+    }
+    await mkdir(this.articles, { recursive: true });
+    for (const entry of await readdir(this.articles, { withFileTypes: true })) {
+      if (entry.isDirectory() && !wanted.has(entry.name)) {
+        await rm(resolve(this.articles, entry.name), { recursive: true, force: true });
+      }
+    }
+    for (const article of wanted.values()) await this.#write(article);
+    await this.#rebuildIndex();
+    return { count: wanted.size };
   }
 
-  stop() {
-    for (const timer of this.#timers.values()) clearInterval(timer);
-    this.#timers.clear();
-  }
-
-  #schedule(source) {
-    clearInterval(this.#timers.get(source.source_id));
-    const timer = setInterval(() => {
-      void this.sync(source);
-    }, source.refresh_minutes * 60_000);
-    timer.unref();
-    this.#timers.set(source.source_id, timer);
-  }
-
-  async #sync(source) {
-    try {
-      const credential = source.credential_name
-        ? (await readFile(this.#credentialPath(source.source_id), "utf8")).trim()
-        : "";
-      const documents = await loadDocuments(source, credential);
-      const chunks = documents.flatMap((document) => chunkDocument(source, document));
-      const destination = resolve(this.sources, `${source.source_id}.json`);
-      const pending = `${destination}.new`;
-      await writeFile(pending, JSON.stringify(chunks, null, 2), { mode: 0o600 });
-      await rename(pending, destination);
-      await this.#rebuildIndex();
-      this.emit("KNOWLEDGE_SYNCED", {
-        source_id: source.source_id,
-        document_count: documents.length,
-        chunk_count: chunks.length,
-      });
-      this.logger.log("info", "knowledge source synchronized", {
-        source_id: source.source_id,
-        document_count: documents.length,
-        chunk_count: chunks.length,
-      });
-      return { document_count: documents.length, chunk_count: chunks.length };
-    } catch (error) {
-      this.emit("KNOWLEDGE_SYNC_FAILED", {
-        source_id: source.source_id,
-        error: String(error),
-      });
-      this.logger.log("error", "knowledge source synchronization failed", {
-        source_id: source.source_id,
-        error: String(error),
-      });
-      throw error;
+  async #write(article) {
+    const directory = resolve(this.articles, article.id);
+    if (dirname(directory) !== this.articles) throw new Error("article path escapes the store");
+    // Rewritten from scratch: a rename or a dropped image would otherwise linger.
+    await rm(directory, { recursive: true, force: true });
+    await mkdir(directory, { recursive: true });
+    await writeFile(resolve(directory, `${article.file}.md`), articleMarkdown(article));
+    for (const asset of article.assets) {
+      const target = resolve(directory, asset.name);
+      if (dirname(target) !== directory) throw new Error("asset path escapes the article");
+      await writeFile(target, Buffer.from(asset.data, "base64"));
     }
   }
 
   async #rebuildIndex() {
     const index = [];
-    for (const name of await readdir(this.sources)) {
-      if (!name.endsWith(".json")) continue;
+    let entries = [];
+    try { entries = await readdir(this.articles, { withFileTypes: true }); } catch { entries = []; }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !SAFE_ID.test(entry.name)) continue;
+      const directory = resolve(this.articles, entry.name);
+      const file = (await readdir(directory)).find((name) => name.endsWith(".md"));
+      if (!file) continue;
       try {
-        const entries = JSON.parse(await readFile(resolve(this.sources, name), "utf8"));
-        if (Array.isArray(entries)) index.push(...entries);
+        const article = parseArticle(await readFile(resolve(directory, file), "utf8"), entry.name);
+        index.push(...chunk(article));
       } catch (error) {
-        this.logger.log("warning", "knowledge source index is invalid", { name, error: String(error) });
+        this.logger?.log("warning", "knowledge article is unreadable", { id: entry.name, error: String(error) });
       }
     }
     const destination = resolve(this.local.knowledge, "index.json");
     const pending = `${destination}.new`;
     await writeFile(pending, JSON.stringify(index, null, 2), { mode: 0o600 });
     await rename(pending, destination);
-  }
-
-  #credentialPath(sourceId) {
-    return resolve(this.local.auth, `knowledge-${sourceId}`);
+    await chmod(destination, 0o600);
+    return index.length;
   }
 }
 
-function validateSource(message) {
-  const sourceId = String(message.source_id ?? "");
-  const kind = String(message.kind ?? "");
-  if (!/^[a-zA-Z0-9_-]{1,120}$/.test(sourceId)) throw new Error("unsafe source id");
-  if (!KINDS.has(kind)) throw new Error("unsupported knowledge source kind");
-  const url = new URL(String(message.url ?? ""));
-  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) {
-    throw new Error("knowledge source must use an HTTP(S) URL without credentials");
+/** `<Name>.md` is frontmatter plus markdown, the same shape the repository uses. */
+export function articleMarkdown(article) {
+  const tags = article.tags.length ? `\ntags: [${article.tags.join(", ")}]` : "";
+  const parent = article.parent_id ? `\nparent_id: ${article.parent_id}` : "";
+  return `---\nid: ${article.id}\nname: ${article.name}\ndescription: ${article.description}${tags}${parent}\n---\n${article.content}`;
+}
+
+export function parseArticle(raw, fallbackId) {
+  const match = /^---\s*\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(String(raw ?? ""));
+  if (!match) return { id: fallbackId, name: fallbackId, description: "", tags: [], parent_id: null, content: String(raw ?? "") };
+  const meta = {};
+  for (const line of match[1].split("\n")) {
+    const separator = line.indexOf(":");
+    if (separator < 1) continue;
+    meta[line.slice(0, separator).trim()] = line.slice(separator + 1).trim();
+  }
+  const tags = /^\[(.*)\]$/.exec(meta.tags ?? "");
+  return {
+    id: SAFE_ID.test(meta.id ?? "") ? meta.id : fallbackId,
+    // The repository in the wild uses `name` on some articles and `title` on others.
+    name: meta.name || meta.title || fallbackId,
+    description: meta.description ?? "",
+    tags: tags ? tags[1].split(",").map((tag) => tag.trim()).filter(Boolean) : [],
+    parent_id: SAFE_ID.test(meta.parent_id ?? "") ? meta.parent_id : null,
+    content: match[2],
+  };
+}
+
+function validArticle(raw) {
+  const id = String(raw?.id ?? "");
+  if (!SAFE_ID.test(id)) throw new Error(`unsafe knowledge id: ${id}`);
+  const content = String(raw.content ?? "");
+  if (Buffer.byteLength(content) > MAX_CONTENT_BYTES) throw new Error(`knowledge article ${id} is too large`);
+  const assets = [];
+  for (const asset of Array.isArray(raw.assets) ? raw.assets : []) {
+    const name = String(asset?.name ?? "");
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/.test(name) || name.endsWith(".md")) {
+      throw new Error(`unsafe knowledge asset name: ${name}`);
+    }
+    const data = String(asset.data ?? "");
+    if (Buffer.byteLength(data, "base64") > MAX_ASSET_BYTES) throw new Error(`knowledge asset ${name} is too large`);
+    assets.push({ name, data });
   }
   return {
-    source_id: sourceId,
-    name: String(message.name ?? sourceId),
-    kind,
-    url: url.toString(),
-    refresh_minutes: Math.max(5, Math.min(10_080, Number(message.refresh_minutes) || 60)),
-    config: message.config && typeof message.config === "object" ? message.config : {},
+    id,
+    name: String(raw.name ?? id).slice(0, 200),
+    file: slug(String(raw.name ?? id)),
+    description: String(raw.description ?? "").slice(0, 2_000),
+    tags: (Array.isArray(raw.tags) ? raw.tags : []).map((tag) => String(tag).trim()).filter(Boolean).slice(0, 50),
+    parent_id: SAFE_ID.test(String(raw.parent_id ?? "")) ? String(raw.parent_id) : null,
+    content,
+    assets,
   };
 }
 
-async function loadDocuments(source, credential) {
-  if (source.kind === "github") return loadGithub(source, credential);
-  if (source.kind === "notion") return loadNotion(source, credential);
-  if (source.kind === "confluence") return loadConfluence(source, credential);
-  return loadHttp(source, credential);
-}
-
-async function loadHttp(source, credential) {
-  const response = await request(source.url, {
-    headers: credential ? { authorization: `Bearer ${credential}` } : {},
-  });
-  const contentType = response.headers.get("content-type") ?? "";
-  const body = await limitedText(response);
-  const text = contentType.includes("html") ? stripHtml(body) : body;
-  return [{ title: source.name, text, url: source.url }];
-}
-
-async function loadGithub(source, credential) {
-  const parsed = new URL(source.url);
-  const parts = parsed.pathname.split("/").filter(Boolean);
-  const offset = parsed.hostname === "api.github.com" && parts[0] === "repos" ? 1 : 0;
-  const owner = parts[offset];
-  const repo = parts[offset + 1]?.replace(/\.git$/, "");
-  if (!owner || !repo) throw new Error("GitHub URL must identify an owner and repository");
-  const headers = {
-    accept: "application/vnd.github+json",
-    ...(credential ? { authorization: `Bearer ${credential}` } : {}),
-  };
-  const repository = await jsonRequest(`https://api.github.com/repos/${owner}/${repo}`, { headers });
-  const ref = String(source.config.ref ?? repository.default_branch ?? "main");
-  const tree = await jsonRequest(
-    `https://api.github.com/repos/${owner}/${repo}/git/trees/${encodeURIComponent(ref)}?recursive=1`,
-    { headers },
-  );
-  const extensions = source.config.extensions ?? [".md", ".txt", ".rst", ".adoc", ".json", ".yaml", ".yml"];
-  const prefix = String(source.config.path_prefix ?? "");
-  const maxFiles = Math.max(1, Math.min(500, Number(source.config.max_files) || 200));
-  const files = (tree.tree ?? [])
-    .filter((item) => item.type === "blob" && item.path.startsWith(prefix) && extensions.some((ext) => item.path.toLowerCase().endsWith(ext)))
-    .slice(0, maxFiles);
-  const documents = [];
-  for (const file of files) {
-    const blob = await jsonRequest(file.url, { headers });
-    if (blob.encoding !== "base64") continue;
-    const text = Buffer.from(blob.content, "base64").toString("utf8");
-    documents.push({
-      title: file.path,
-      text,
-      url: `https://github.com/${owner}/${repo}/blob/${encodeURIComponent(ref)}/${file.path}`,
-    });
-  }
-  return documents;
-}
-
-async function loadNotion(source, credential) {
-  if (!credential) throw new Error("Notion source requires a credential");
-  const headers = {
-    authorization: `Bearer ${credential}`,
-    "content-type": "application/json",
-    "notion-version": "2022-06-28",
-  };
-  const result = await jsonRequest("https://api.notion.com/v1/search", {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ page_size: Math.max(1, Math.min(100, Number(source.config.max_pages) || 50)) }),
-  });
-  const documents = [];
-  for (const page of (result.results ?? []).filter((item) => item.object === "page")) {
-    const blocks = await jsonRequest(`https://api.notion.com/v1/blocks/${page.id}/children?page_size=100`, { headers });
-    const text = (blocks.results ?? []).flatMap(blockText).join("\n");
-    const title = Object.values(page.properties ?? {}).flatMap((property) => property.title ?? []).map((item) => item.plain_text).join("") || page.id;
-    documents.push({ title, text, url: page.url });
-  }
-  return documents;
-}
-
-async function loadConfluence(source, credential) {
-  const base = source.url.replace(/\/$/, "");
-  const params = new URLSearchParams({
-    expand: "body.storage,version",
-    limit: String(Math.max(1, Math.min(100, Number(source.config.max_pages) || 100))),
-  });
-  if (source.config.space_key) params.set("spaceKey", String(source.config.space_key));
-  let authorization = "";
-  if (credential && source.config.username) {
-    authorization = `Basic ${Buffer.from(`${source.config.username}:${credential}`).toString("base64")}`;
-  } else if (credential) authorization = `Bearer ${credential}`;
-  const result = await jsonRequest(`${base}/rest/api/content?${params}`, {
-    headers: authorization ? { authorization } : {},
-  });
-  return (result.results ?? []).map((page) => ({
-    title: page.title,
-    text: stripHtml(page.body?.storage?.value ?? ""),
-    url: new URL(page._links?.webui ?? "", base).toString(),
-  }));
-}
-
-function blockText(block) {
-  const value = block[block.type];
-  return (value?.rich_text ?? []).map((item) => item.plain_text ?? "");
-}
-
-function chunkDocument(source, document) {
-  const text = String(document.text ?? "").replace(/\r\n/g, "\n").trim();
+/** Same chunk shape the index has always held, so `search_knowledge` is unchanged. */
+function chunk(article) {
+  const text = article.content.replace(/\r\n/g, "\n").trim();
   const chunks = [];
-  for (let start = 0; start < text.length; start += 1_300) {
-    const value = text.slice(start, start + 1_500).trim();
+  for (let start = 0; start < text.length; start += CHUNK_STRIDE) {
+    const value = text.slice(start, start + CHUNK_SIZE).trim();
     if (!value) continue;
     chunks.push({
-      source_id: source.source_id,
-      source_name: source.name,
-      title: document.title,
+      source_id: article.id,
+      source_name: article.name,
+      title: article.name,
       text: value,
-      source: document.url,
+      source: article.description,
       chunk: chunks.length,
       updated_at: new Date().toISOString(),
     });
   }
+  if (!chunks.length && article.name) {
+    // A title-only article is still worth finding.
+    chunks.push({ source_id: article.id, source_name: article.name, title: article.name, text: article.description, source: article.description, chunk: 0, updated_at: new Date().toISOString() });
+  }
   return chunks;
 }
 
-async function request(url, options = {}) {
-  const response = await fetch(url, { ...options, signal: AbortSignal.timeout(30_000) });
-  if (!response.ok) throw new Error(`knowledge request failed with HTTP ${response.status}`);
-  const length = Number(response.headers.get("content-length") ?? 0);
-  if (length > MAX_RESPONSE_BYTES) throw new Error("knowledge response exceeds 5 MiB");
-  return response;
-}
-
-async function limitedText(response) {
-  const buffer = Buffer.from(await response.arrayBuffer());
-  if (buffer.length > MAX_RESPONSE_BYTES) throw new Error("knowledge response exceeds 5 MiB");
-  return buffer.toString("utf8");
-}
-
-async function jsonRequest(url, options = {}) {
-  const response = await request(url, options);
-  return JSON.parse(await limitedText(response));
-}
-
-function stripHtml(value) {
-  return String(value)
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/\s+/g, " ")
-    .trim();
+export function slug(value) {
+  const cleaned = String(value).trim().replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80);
+  return cleaned || "article";
 }

@@ -14,8 +14,9 @@ const MAX_VALUE_BYTES = 1_000_000;
 export class AgentDataStore {
   #pending = Promise.resolve();
 
-  constructor(local) {
+  constructor(local, knowledge) {
     this.local = local;
+    this.knowledge = knowledge;
     this.profileDirectory = resolve(local.config, "llm-profiles");
     this.defaultProfileFile = resolve(local.config, "default-llm-profile.json");
   }
@@ -288,6 +289,11 @@ export class AgentDataStore {
     return {
       skills: await this.#refreshAccountSkills(Array.isArray(input.skills) ? input.skills : []),
       configs: await this.#refreshAccountConfigs(Array.isArray(input.configs) ? input.configs : []),
+      // Knowledge is replaced wholesale rather than reconciled: an article is only
+      // ever a copy of what the account shares, never edited here.
+      knowledge: this.knowledge
+        ? await this.knowledge.apply(Array.isArray(input.knowledge) ? input.knowledge : [])
+        : { count: 0 },
     };
   }
 

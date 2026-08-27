@@ -102,18 +102,14 @@ test("agent-owned skills and config maps support local CRUD and account imports"
       skills: [{ source_id: "account-skill-1", name: "Incident response", content: "# Incident response v3\n" }],
       configs: [{ source_id: "account-config-1", name: "ACCOUNT_DEFAULTS", title: "Account defaults", normal_values: { IMPORTED_SETTING: "refreshed" } }],
     });
-    assert.deepEqual(refreshed, {
-      skills: { created: 0, updated: 1, removed: 0 },
-      configs: { created: 0, updated: 1, removed: 0 },
-    });
+    assert.deepEqual(refreshed.skills, { created: 0, updated: 1, removed: 0 });
+    assert.deepEqual(refreshed.configs, { created: 0, updated: 1, removed: 0 });
     assert.match((await store.handle("skill.get", { skill_id: importedSkills[0].skill_id })).item.content, /v3/);
     assert.equal(process.env.IMPORTED_SETTING, "refreshed");
 
     const revoked = await store.handle("account.refresh", { skills: [], configs: [] });
-    assert.deepEqual(revoked, {
-      skills: { created: 0, updated: 0, removed: 1 },
-      configs: { created: 0, updated: 0, removed: 1 },
-    });
+    assert.deepEqual(revoked.skills, { created: 0, updated: 0, removed: 1 });
+    assert.deepEqual(revoked.configs, { created: 0, updated: 0, removed: 1 });
     // The manual skill written outside Zidane is never touched by an account sync.
     const survivingSkills = (await store.handle("skill.list")).items;
     assert.deepEqual(survivingSkills.map((item) => item.name), ["manual-skill"]);

@@ -14,7 +14,7 @@ import {
   readSessionToken,
   writeSessionToken,
 } from "./config.mjs";
-import { KnowledgeManager } from "./knowledge.mjs";
+import { KnowledgeStore } from "./knowledge.mjs";
 import { AgentLogger } from "./logger.mjs";
 import { PiAuthManager } from "./llm-auth.mjs";
 import { MemoryStore } from "./memory.mjs";
@@ -57,9 +57,9 @@ logger.log("info", "agent storage ready", {
 });
 const memory = new MemoryStore(local);
 const runtime = new PiRuntime(config, local, send, logger, memory);
-const knowledge = new KnowledgeManager(local, send, logger);
+const knowledge = new KnowledgeStore(local, logger);
 const llmAuth = new PiAuthManager(local, send, logger);
-const agentData = new AgentDataStore(local);
+const agentData = new AgentDataStore(local, knowledge);
 let modelCatalog = [];
 try {
   modelCatalog = await loadModelCatalog(local);
@@ -237,22 +237,6 @@ async function handleMessage(message) {
     }
     return;
   }
-  if (message.type === "APPLY_KNOWLEDGE_SOURCE") {
-    void knowledge.apply(message).catch(() => undefined);
-    return;
-  }
-  if (message.type === "REMOVE_KNOWLEDGE_SOURCE") {
-    try {
-      await knowledge.remove(String(message.source_id ?? ""));
-      logger.log("info", "knowledge source removed", { source_id: message.source_id });
-    } catch (error) {
-      logger.log("error", "knowledge source removal failed", {
-        source_id: message.source_id,
-        error: String(error),
-      });
-    }
-    return;
-  }
   if (message.type === "MEMORY_QUERY") {
     try {
       const items = await memory.query(
@@ -405,7 +389,6 @@ async function connect() {
 
 function shutdown(signal) {
   stopped = true;
-  knowledge.stop();
   logger.log("info", "agent stopping", { signal });
   socket?.close(1001, "service stopping");
 }
