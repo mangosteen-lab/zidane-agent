@@ -15,6 +15,7 @@ import {
   resolveLlmProfile,
   writeSessionToken,
 } from "./config.mjs";
+import { CronScheduler, CronStore } from "./cron.mjs";
 import { DailyJournal } from "./daily.mjs";
 import { KnowledgeStore } from "./knowledge.mjs";
 import { AgentLogger } from "./logger.mjs";
@@ -62,7 +63,14 @@ const journal = new DailyJournal(local, logger);
 const runtime = new PiRuntime(config, local, send, logger, memory, journal);
 const knowledge = new KnowledgeStore(local, logger);
 const llmAuth = new PiAuthManager(local, send, logger);
-const agentData = new AgentDataStore(local, knowledge);
+const cronStore = new CronStore(local);
+// Scheduled runs get a lane of their own so a nightly task is never refused because
+// someone is chatting, and a shared midnight schedule cannot open a session per task.
+const cron = new CronScheduler(cronStore, runtime, logger, {
+  limit: Number.parseInt(process.env.ZIDANE_AGENT_CRON_CONCURRENCY ?? "3", 10) || 3,
+  intervalMs: (Number.parseInt(process.env.ZIDANE_AGENT_CRON_INTERVAL_SECONDS ?? "30", 10) || 30) * 1_000,
+});
+const agentData = new AgentDataStore(local, knowledge, cron);
 let modelCatalog = [];
 try {
   modelCatalog = await loadModelCatalog(local);
@@ -70,6 +78,7 @@ try {
   logger.log("warning", "Pi model catalog could not be loaded", { error: String(error) });
 }
 await knowledge.start();
+if ((process.env.ZIDANE_AGENT_CRON ?? "true") !== "false") cron.start();
 
 // The day's work is summarised into memory once the day is over. Checked on a slow
 // timer rather than scheduled for an hour: an agent that was asleep at midnight, or
@@ -436,7 +445,7 @@ async function connect() {
       capabilities: {
         pi_sdk: true,
         parallel_sessions: config.capacity,
-        agent_storage: { version: 3, resources: ["skills", "config_maps", "secrets", "llm_profiles"] },
+        agent_storage: { version: 4, resources: ["skills", "config_maps", "secrets", "llm_profiles", "crontab"] },
         providers: modelCatalog.map((provider) => provider.id),
         model_catalog: modelCatalog,
       },
@@ -465,6 +474,7 @@ async function connect() {
 function shutdown(signal) {
   stopped = true;
   if (digestTimer) clearInterval(digestTimer);
+  cron.stop();
   logger.log("info", "agent stopping", { signal });
   socket?.close(1001, "service stopping");
 }

@@ -32,6 +32,7 @@ export function paths(config) {
     skills: resolve(root, "skills"), memory: resolve(root, "memory"),
     knowledge: resolve(root, "knowledge"), config: resolve(root, "config"),
     configMaps: resolve(root, "config-maps"),
+    crontab: resolve(root, "crontab"),
     sessions: resolve(root, "sessions"),
     auth: resolve(root, "auth"),
     workspaces: resolve(root, "workspaces"), exports: resolve(root, "exports"),

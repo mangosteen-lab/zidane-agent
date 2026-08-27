@@ -3,7 +3,7 @@ import { cp, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promi
 import { relative, resolve } from "node:path";
 import * as tar from "tar";
 
-const ROOTS = ["agent.json", "SOUL.md", "skills", "memory", "knowledge", "config", "config-maps"];
+const ROOTS = ["agent.json", "SOUL.md", "skills", "memory", "knowledge", "config", "config-maps", "crontab"];
 // `config-maps` travels, but the secret values seeded into the environment from
 // `config-maps/.env` never do: a portable archive carries configuration, not credentials.
 const EXCLUDED = new Set(["config-maps/.env"]);

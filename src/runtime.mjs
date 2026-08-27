@@ -1,6 +1,7 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
+import { discoverSkills } from "./agent-data.mjs";
 import { readSecretValue, resolveLlmProfile } from "./config.mjs";
 import { contextTools } from "./context-tools.mjs";
 
@@ -125,6 +126,43 @@ export class PiRuntime {
     await rm(resolve(this.local.sessions, `${conversation}.json`), { force: true });
   }
 
+  /**
+   * Run one scheduled task to completion and return its report.
+   *
+   * Deliberately outside `config.capacity`: a nightly task must not be refused because
+   * someone is chatting, and it is `CronScheduler` that bounds how many may run at once.
+   * Nothing is emitted — no `PROMPT_EVENT`, no `PROMPT_DONE` — so the run stays invisible
+   * to every chat surface; the log and the task's history are the only trace. The session
+   * and its workspace are destroyed when the run ends, whether it succeeded or not.
+   */
+  async runTask({ id, prompt, skills = [] }) {
+    const conversation = safeName(`cron-${id}`);
+    if (this.#running.has(conversation)) throw new BusyError("conversation");
+    this.#running.add(conversation);
+    const workspace = resolve(this.local.workspaces, conversation);
+    // A task that names skills sees only those: an unattended run should not be able to
+    // reach for a skill the schedule never authorised.
+    const staged = skills.length ? resolve(this.local.workspaces, `${conversation}.skills`) : null;
+    try {
+      if (staged) await stageSkills(this.local.skills, skills, staged);
+      let profile = {};
+      try { profile = await resolveLlmProfile(this.local); } catch { profile = {}; }
+      const { session } = await this.#session(conversation, workspace, profile, staged ? [staged] : [this.local.skills]);
+      let text = "";
+      session.subscribe((event) => {
+        if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
+          text += event.assistantMessageEvent.delta;
+        }
+      });
+      await session.prompt(prompt);
+      return text.trim().slice(0, 20_000);
+    } finally {
+      this.#running.delete(conversation);
+      if (staged) await rm(staged, { recursive: true, force: true });
+      await this.#discard(conversation);
+    }
+  }
+
   cancel(deliveryId) {
     const entry = this.#active.get(deliveryId);
     if (!entry) return false;
@@ -134,7 +172,7 @@ export class PiRuntime {
   }
 
   /** Everything a prompt needs before it can be sent: workspace, model, session. */
-  async #session(conversation, workspace, profile) {
+  async #session(conversation, workspace, profile, skillPaths = [this.local.skills]) {
     await mkdir(workspace, { recursive: true });
     const runtime = await ModelRuntime.create({ authPath: resolve(this.local.auth, "pi-auth.json"), modelsPath: resolve(this.local.config, "models.json") });
     if (profile.provider && profile.secret_value) {
@@ -145,7 +183,7 @@ export class PiRuntime {
       cwd: workspace,
       agentDir: this.local.root,
       systemPromptOverride: () => soul,
-      additionalSkillPaths: [this.local.skills],
+      additionalSkillPaths: skillPaths,
     });
     await loader.reload();
     const model = profile.provider && profile.model ? runtime.getModel(profile.provider, profile.model) : undefined;
@@ -202,6 +240,21 @@ export class PiRuntime {
       this.logger?.log("error", "prompt failed", { delivery_id: delivery.delivery_id, conversation_id: delivery.conversation_id, error: String(error) });
     }
   }
+}
+
+/** Copy the named skills into a directory of their own for one scheduled run. */
+export async function stageSkills(root, names, destination) {
+  const wanted = new Set(names.map((name) => String(name).trim().toLowerCase()));
+  const available = await discoverSkills(root);
+  await mkdir(destination, { recursive: true });
+  const copied = [];
+  for (const skill of available) {
+    if (!wanted.has(skill.name.trim().toLowerCase()) && !wanted.has(skill.skill_id)) continue;
+    await cp(skill.directory, resolve(destination, safeName(skill.name)), { recursive: true });
+    copied.push(skill.name);
+  }
+  if (!copied.length) throw new Error(`none of the task's skills are installed on this agent: ${names.join(", ")}`);
+  return copied;
 }
 
 function safeName(value) { return String(value).replace(/[^a-zA-Z0-9._-]/g, "_"); }

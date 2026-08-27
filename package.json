@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "node src/index.mjs",
-    "check": "node --check src/index.mjs && node --check src/config.mjs && node --check src/daily.mjs && node --check src/dotenv.mjs && node --check src/agent-data.mjs && node --check src/runtime.mjs && node --check src/context-tools.mjs && node --check src/knowledge.mjs && node --check src/llm-auth.mjs && node --check src/logger.mjs && node --check src/memory.mjs && node --check src/model-catalog.mjs && node --check src/portable.mjs",
+    "check": "node --check src/index.mjs && node --check src/config.mjs && node --check src/cron.mjs && node --check src/daily.mjs && node --check src/dotenv.mjs && node --check src/agent-data.mjs && node --check src/runtime.mjs && node --check src/context-tools.mjs && node --check src/knowledge.mjs && node --check src/llm-auth.mjs && node --check src/logger.mjs && node --check src/memory.mjs && node --check src/model-catalog.mjs && node --check src/portable.mjs",
     "test": "node --test"
   },
   "dependencies": {

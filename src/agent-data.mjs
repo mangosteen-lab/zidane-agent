@@ -14,9 +14,12 @@ const MAX_VALUE_BYTES = 1_000_000;
 export class AgentDataStore {
   #pending = Promise.resolve();
 
-  constructor(local, knowledge) {
+  constructor(local, knowledge, cron) {
     this.local = local;
     this.knowledge = knowledge;
+    // Present only where a scheduler is running; the REST relay reports the operation as
+    // unsupported rather than pretending a task was stored on an agent that cannot run it.
+    this.cron = cron;
     this.profileDirectory = resolve(local.config, "llm-profiles");
     this.defaultProfileFile = resolve(local.config, "default-llm-profile.json");
   }
@@ -43,8 +46,18 @@ export class AgentDataStore {
     if (operation === "llm.update") return { item: await this.#updateProfile(input) };
     if (operation === "llm.delete") return { deleted: await this.#deleteProfile(input.profile_id) };
     if (operation === "llm.select") return { item: await this.#selectProfile(input.profile_id) };
+    if (operation === "cron.list") return this.#cron().store.list();
+    if (operation === "cron.create") return { item: await this.#cron().store.create(input) };
+    if (operation === "cron.update") return { item: await this.#cron().store.update(input) };
+    if (operation === "cron.delete") return { deleted: await this.#cron().store.delete(input.task_id) };
+    if (operation === "cron.run") return { started: await this.#cron().start(input.task_id) };
     if (operation === "account.refresh") return this.#refreshAccountResources(input);
     throw new Error(`unsupported agent data operation: ${operation}`);
+  }
+
+  #cron() {
+    if (!this.cron) throw new Error("scheduled tasks are not available on this agent");
+    return this.cron;
   }
 
   async #listSkills() {
@@ -467,7 +480,7 @@ export class AgentDataStore {
   }
 }
 
-async function discoverSkills(root) {
+export async function discoverSkills(root) {
   const found = [];
   async function walk(directory, depth) {
     if (depth > 8) return;
