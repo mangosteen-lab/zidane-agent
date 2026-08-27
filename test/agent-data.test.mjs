@@ -34,15 +34,22 @@ test("agent-owned skills and config maps support local CRUD and account imports"
     assert.equal(updatedSkill.name, "Deploy with checks");
     assert.equal((await store.handle("skill.delete", { skill_id: createdSkill.skill_id })).deleted, true);
 
-    const importedSkills = (await store.handle("skill.import", {
-      items: [{ source_id: "account-skill-1", name: "Incident response", content: "# Incident response\n" }],
-    })).items;
+    const firstSync = await store.handle("account.refresh", {
+      skills: [{ source_id: "account-skill-1", name: "Incident response", content: "# Incident response\n" }],
+      configs: [],
+    });
+    assert.deepEqual(firstSync.skills, { created: 1, updated: 0, removed: 0 });
+    const importedSkills = (await store.handle("skill.list")).items.filter((item) => item.source.scope === "account");
     assert.equal(importedSkills[0].source.scope, "account");
     assert.equal(importedSkills[0].source.id, "account-skill-1");
     // Re-importing the same account skill updates the copy in place.
-    const reimported = (await store.handle("skill.import", {
-      items: [{ source_id: "account-skill-1", name: "Incident response", content: "# Incident response v2\n" }],
-    })).items;
+    await store.handle("account.refresh", {
+      skills: [{ source_id: "account-skill-1", name: "Incident response", content: "# Incident response v2\n" }],
+      configs: [],
+    });
+    // A kind left empty means nothing is shared, so the copies go.
+    assert.equal((await store.handle("config.list")).items.filter((item) => item.sync).length, 0);
+    const reimported = (await store.handle("skill.list")).items.filter((item) => item.source.scope === "account");
     assert.equal(reimported[0].skill_id, importedSkills[0].skill_id);
     assert.equal((await store.handle("skill.list")).items.filter((item) => item.source.scope === "account").length, 1);
     assert.match((await store.handle("skill.get", { skill_id: reimported[0].skill_id })).item.content, /v2/);
@@ -54,9 +61,11 @@ test("agent-owned skills and config maps support local CRUD and account imports"
       secret_values: ["LOCAL_RUNTIME_TOKEN"],
     })).item;
     assert.equal(process.env[environmentKey], "local");
-    const importedConfigs = (await store.handle("config.import", {
-      items: [{ source_id: "account-config-1", name: "ACCOUNT_DEFAULTS", title: "Account defaults", normal_values: { IMPORTED_SETTING: "yes" } }],
-    })).items;
+    await store.handle("account.refresh", {
+      skills: [{ source_id: "account-skill-1", name: "Incident response", content: "# Incident response v2\n" }],
+      configs: [{ source_id: "account-config-1", name: "ACCOUNT_DEFAULTS", title: "Account defaults", normal_values: { IMPORTED_SETTING: "yes" } }],
+    });
+    const importedConfigs = (await store.handle("config.list")).items.filter((item) => item.sync);
     // `sync` marks the copies the control plane is responsible for.
     assert.equal(importedConfigs[0].sync, true);
     assert.equal(importedConfigs[0].source_id, "account-config-1");
@@ -94,16 +103,16 @@ test("agent-owned skills and config maps support local CRUD and account imports"
       configs: [{ source_id: "account-config-1", name: "ACCOUNT_DEFAULTS", title: "Account defaults", normal_values: { IMPORTED_SETTING: "refreshed" } }],
     });
     assert.deepEqual(refreshed, {
-      skills: { updated: 1, removed: 0 },
-      configs: { updated: 1, removed: 0 },
+      skills: { created: 0, updated: 1, removed: 0 },
+      configs: { created: 0, updated: 1, removed: 0 },
     });
     assert.match((await store.handle("skill.get", { skill_id: importedSkills[0].skill_id })).item.content, /v3/);
     assert.equal(process.env.IMPORTED_SETTING, "refreshed");
 
     const revoked = await store.handle("account.refresh", { skills: [], configs: [] });
     assert.deepEqual(revoked, {
-      skills: { updated: 0, removed: 1 },
-      configs: { updated: 0, removed: 1 },
+      skills: { created: 0, updated: 0, removed: 1 },
+      configs: { created: 0, updated: 0, removed: 1 },
     });
     // The manual skill written outside Zidane is never touched by an account sync.
     const survivingSkills = (await store.handle("skill.list")).items;

@@ -32,13 +32,11 @@ export class AgentDataStore {
     if (operation === "skill.create") return { item: await this.#createSkill(input) };
     if (operation === "skill.update") return { item: await this.#updateSkill(input) };
     if (operation === "skill.delete") return { deleted: await this.#deleteSkill(input.skill_id) };
-    if (operation === "skill.import") return { items: await this.#importSkills(input.items) };
     if (operation === "config.list") return { items: (await this.#loadConfigs()).map((item) => publicConfig(item)) };
     if (operation === "config.get") return { item: await this.#getConfig(input.config_id) };
     if (operation === "config.create") return { item: await this.#createConfig(input) };
     if (operation === "config.update") return { item: await this.#updateConfig(input) };
     if (operation === "config.delete") return { deleted: await this.#deleteConfig(input.config_id) };
-    if (operation === "config.import") return { items: await this.#importConfigs(input.items) };
     if (operation === "llm.list") return { items: await this.#listProfiles() };
     if (operation === "llm.create") return { item: await this.#createProfile(input) };
     if (operation === "llm.update") return { item: await this.#updateProfile(input) };
@@ -120,36 +118,17 @@ export class AgentDataStore {
     return true;
   }
 
-  async #importSkills(rawItems) {
-    const incoming = Array.isArray(rawItems) ? rawItems : [];
-    if (!incoming.length || incoming.length > 100) throw new Error("select between 1 and 100 skills");
-    await mkdir(this.local.skills, { recursive: true });
-    const entries = await this.#skillEntries();
-    const imported = [];
-    for (const raw of incoming) {
-      const sourceId = validId(raw.source_id, "account skill");
-      const name = validName(raw.name, "skill");
-      const content = validContent(raw.content);
-      const existing = entries.find((item) => item.source?.scope === "account" && item.source.id === sourceId);
-      const timestamp = Date.now();
-      const metadata = {
-        id: existing?.skill_id ?? crypto.randomUUID(),
-        name,
-        source: { scope: "account", id: sourceId },
-        created_at: existing?.created_at ?? timestamp,
-        updated_at: timestamp,
-      };
-      await this.#writeSkill(existing?.directory ?? (await this.#skillDirectory(name)), metadata, content);
-      imported.push(publicSkill({ ...metadata, content }));
-    }
-    return imported;
-  }
+  
 
   async #refreshAccountSkills(incoming) {
     const allowed = new Map(incoming.map((raw) => [validId(raw.source_id, "account skill"), raw]));
+    const seen = new Set();
+    let created = 0;
     let updated = 0;
     let removed = 0;
+    await mkdir(this.local.skills, { recursive: true });
     for (const entry of await this.#skillEntries()) {
+      // A hand-placed skill has no source record and is never touched by a sync.
       if (entry.source?.scope !== "account") continue;
       const raw = allowed.get(entry.source.id);
       if (!raw) {
@@ -157,6 +136,7 @@ export class AgentDataStore {
         removed += 1;
         continue;
       }
+      seen.add(entry.source.id);
       await this.#writeSkill(
         entry.directory,
         {
@@ -170,7 +150,24 @@ export class AgentDataStore {
       );
       updated += 1;
     }
-    return { updated, removed };
+    for (const [sourceId, raw] of allowed) {
+      if (seen.has(sourceId)) continue;
+      const name = validName(raw.name, "skill");
+      const timestamp = Date.now();
+      await this.#writeSkill(
+        await this.#skillDirectory(name),
+        {
+          id: crypto.randomUUID(),
+          name,
+          source: { scope: "account", id: sourceId },
+          created_at: timestamp,
+          updated_at: timestamp,
+        },
+        validContent(raw.content),
+      );
+      created += 1;
+    }
+    return { created, updated, removed };
   }
 
   /** Config maps used to live under `config/agent-config-maps/`. */
@@ -285,23 +282,7 @@ export class AgentDataStore {
     return true;
   }
 
-  async #importConfigs(rawItems) {
-    const incoming = Array.isArray(rawItems) ? rawItems : [];
-    if (!incoming.length || incoming.length > 100) throw new Error("select between 1 and 100 configuration maps");
-    const imported = [];
-    for (const raw of incoming) {
-      const sourceId = validId(raw.source_id, "account configuration");
-      const existing = (await this.#loadConfigs()).find((item) => item.source_id === sourceId);
-      const name = validConfigName(raw.name);
-      const clash = await this.#findConfig(name);
-      if (clash && clash.source_id !== sourceId) throw new Error(`a config map named ${name} already exists`);
-      await this.#writeConfig(name, this.#configRecord(existing, { ...raw, name, sync: true, source_id: sourceId }));
-      if (existing && existing.name !== name) await rm(this.#configPath(existing.name), { force: true });
-      imported.push(publicConfig(await this.#findConfig(name)));
-    }
-    await this.#applyConfigs();
-    return imported;
-  }
+  
 
   async #refreshAccountResources(input) {
     return {
@@ -312,6 +293,8 @@ export class AgentDataStore {
 
   async #refreshAccountConfigs(incoming) {
     const allowed = new Map(incoming.map((raw) => [validId(raw.source_id, "account configuration"), raw]));
+    const seen = new Set();
+    let created = 0;
     let updated = 0;
     let removed = 0;
     for (const item of await this.#loadConfigs()) {
@@ -323,15 +306,26 @@ export class AgentDataStore {
         removed += 1;
         continue;
       }
+      seen.add(item.source_id);
       const name = validConfigName(raw.name);
       const clash = await this.#findConfig(name);
       if (clash && clash.source_id !== item.source_id) throw new Error(`a config map named ${name} already exists`);
+      await this.#applySecretEntries(raw.secret_entries);
       await this.#writeConfig(name, this.#configRecord(item, { ...raw, name, sync: true, source_id: item.source_id }));
       if (item.name !== name) await rm(this.#configPath(item.name), { force: true });
       updated += 1;
     }
-    if (updated || removed) await this.#applyConfigs();
-    return { updated, removed };
+    for (const [sourceId, raw] of allowed) {
+      if (seen.has(sourceId)) continue;
+      const name = validConfigName(raw.name);
+      const clash = await this.#findConfig(name);
+      if (clash && clash.source_id !== sourceId) throw new Error(`a config map named ${name} already exists`);
+      await this.#applySecretEntries(raw.secret_entries);
+      await this.#writeConfig(name, this.#configRecord(clash, { ...raw, name, sync: true, source_id: sourceId }));
+      created += 1;
+    }
+    if (created || updated || removed) await this.#applyConfigs();
+    return { created, updated, removed };
   }
 
   // ------------------------------------------------------------ LLM profiles
@@ -573,8 +567,6 @@ function validValues(value) {
   }
   return clean;
 }
-
-
 
 async function secretKeys(directory) {
   const entries = await readdir(directory, { withFileTypes: true });
