@@ -1,5 +1,6 @@
-import { chmod, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+import { loadEnvFile, readEnvFile, writeEnvFile } from "./dotenv.mjs";
 
 const DEFAULT_WORKDIR = "/var/lib/zidane-agent";
 
@@ -30,10 +31,11 @@ export function paths(config) {
     root, agent: resolve(root, "agent.json"), soul: resolve(root, "SOUL.md"),
     skills: resolve(root, "skills"), memory: resolve(root, "memory"),
     knowledge: resolve(root, "knowledge"), config: resolve(root, "config"),
-    secrets: resolve(root, "secrets"), sessions: resolve(root, "sessions"),
-    syncedSecrets: resolve(root, "secrets", "synced"),
+    configMaps: resolve(root, "config-maps"),
+    sessions: resolve(root, "sessions"),
+    auth: resolve(root, "auth"),
     workspaces: resolve(root, "workspaces"), exports: resolve(root, "exports"),
-    logs: resolve(root, "logs"), token: resolve(root, "secrets", "session-token"),
+    logs: resolve(root, "logs"), token: resolve(root, "auth", "session-token"),
   };
 }
 
@@ -42,10 +44,14 @@ export async function initialise(config) {
   await Promise.all(Object.values(local).filter((value) => !value.endsWith(".json") && !value.endsWith(".md") && !value.endsWith("session-token"))
     .map((value) => mkdir(value, { recursive: true })));
   await chmod(local.root, 0o700);
-  await chmod(local.secrets, 0o700);
-  await chmod(local.syncedSecrets, 0o700);
+  await chmod(local.auth, 0o700);
+  await migrateSecretLayout(local);
   process.env.ZIDANE_AGENT_CONFIG_FILE = resolve(local.config, "applied.json");
-  process.env.ZIDANE_AGENT_SYNCED_SECRETS_DIR = local.syncedSecrets;
+  // Where a skill or tool should look for agent-owned state. Set before the applied
+  // config is replayed below, and reserved from it, so a config map cannot redirect
+  // a skill to a directory of its own choosing.
+  process.env.AI_AGENT_CONFIG_MAPS_FOLDER = local.configMaps;
+  await loadEnvFile(local);
   try {
     const applied = JSON.parse(await readFile(process.env.ZIDANE_AGENT_CONFIG_FILE, "utf8"));
     for (const [key, value] of Object.entries(applied.values ?? {})) {
@@ -108,9 +114,49 @@ export async function applyAgentInfo(local, config, message) {
   return { name, description, capacity };
 }
 
+
+
+/**
+ * Apply the control plane's desired state.
+ *
+ * `values` are ordinary configuration; `secretValues` are written to `config-maps/.env`
+ * and merged into the environment, which is the only place a secret value ever lives.
+ */
 export async function applyState(local, revision, values, secretValues) {
   await applyConfigValues(local, revision, values);
-  await applySyncedSecrets(local, secretValues);
+  await applySecretValues(local, secretValues);
+}
+
+/** Resolve one secret value by name. The environment is the single lookup. */
+export function readSecretValue(name) {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(String(name ?? ""))) throw new Error(`unsafe secret value name: ${name}`);
+  const value = process.env[name];
+  if (value === undefined || value === "") throw new Error(`no value for ${name}; set it in the environment or config-maps/.env`);
+  return value;
+}
+
+export async function applySecretValues(local, secretValues) {
+  const incoming = {};
+  for (const [key, value] of Object.entries(secretValues ?? {})) {
+    if (!isRuntimeEnvironmentKey(key)) throw new Error(`reserved secret value name: ${key}`);
+    incoming[key] = String(value ?? "");
+  }
+  const stored = await readEnvFile(local);
+  const appliedPath = resolve(local.config, "applied-secrets.json");
+  let previous = [];
+  try { previous = JSON.parse(await readFile(appliedPath, "utf8")); } catch { /* first application */ }
+  if (!Array.isArray(previous)) previous = Object.keys(previous ?? {});
+  // A key this revision drops is removed from the file, and from the environment if
+  // that is where it came from.
+  for (const key of previous) {
+    if (key in incoming) continue;
+    delete stored[key];
+    if (process.env[key] !== undefined && !(key in incoming)) delete process.env[key];
+  }
+  Object.assign(stored, incoming);
+  await writeEnvFile(local, stored);
+  for (const [key, value] of Object.entries(incoming)) process.env[key] = value;
+  await atomicJson(appliedPath, Object.keys(incoming).sort(), 0o600);
 }
 
 export async function applyConfigValues(local, revision, values) {
@@ -131,65 +177,51 @@ export async function applyConfigValues(local, revision, values) {
   await atomicJson(appliedPath, { revision, values: cleanValues });
 }
 
-const SAFE_SECRET_KEY = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
 
 /** A secret is a named directory of mode-0600 key files, mirroring a config map. */
-async function applySyncedSecrets(local, secretValues) {
-  const next = {};
-  for (const [name, entries] of Object.entries(secretValues ?? {})) {
-    if (!SAFE_SECRET_KEY.test(name)) throw new Error(`unsafe secret name: ${name}`);
-    next[name] = normaliseSecretEntries(name, entries);
+/**
+ * Retire the separate secret store.
+ *
+ * Secrets used to be their own kind, kept in `secrets/` beside the agent's own
+ * credentials. They are now just the named values a config map declares, resolved from
+ * the environment, so the store is removed outright — the operator provisions the
+ * values through the deployment or `config-maps/.env`.
+ */
+async function migrateSecretLayout(local) {
+  for (const name of ["session-token", "pi-auth.json"]) {
+    try { await rename(resolve(local.root, "secrets", name), resolve(local.auth, name)); }
+    catch { /* already moved, or never existed */ }
   }
-  const appliedSecretsPath = resolve(local.config, "applied-secrets.json");
-  let previous = {};
-  try { previous = JSON.parse(await readFile(appliedSecretsPath, "utf8")); } catch { /* first application */ }
-  // A list is what versions before key/value secrets wrote here.
-  if (Array.isArray(previous)) previous = Object.fromEntries(previous.map((name) => [name, null]));
-  for (const [name, keys] of Object.entries(previous)) {
-    if (!SAFE_SECRET_KEY.test(name)) continue;
-    const target = secretDirectory(local, name);
-    if (!(name in next)) { await rm(target, { recursive: true, force: true }); continue; }
-    if (!Array.isArray(keys)) { await rm(target, { recursive: true, force: true }); continue; }
-    for (const key of keys) {
-      if (SAFE_SECRET_KEY.test(key) && !(key in next[name])) await rm(resolve(target, key), { force: true });
+  let entries = [];
+  try { entries = await readdir(resolve(local.root, "secrets"), { withFileTypes: true }); } catch { return; }
+  for (const entry of entries) {
+    if (entry.isFile() && entry.name.startsWith("knowledge-")) {
+      try { await rename(resolve(local.root, "secrets", entry.name), resolve(local.auth, entry.name)); }
+      catch { /* already moved */ }
     }
   }
-  for (const [name, entries] of Object.entries(next)) {
-    const directory = secretDirectory(local, name);
-    await mkdir(directory, { recursive: true });
-    await chmod(directory, 0o700);
-    for (const [key, value] of Object.entries(entries)) {
-      await writeFile(resolve(directory, key), value, { mode: 0o600 });
-      await chmod(resolve(directory, key), 0o600);
-    }
-  }
-  await atomicJson(
-    appliedSecretsPath,
-    Object.fromEntries(Object.entries(next).map(([name, entries]) => [name, Object.keys(entries)])),
-    0o600,
-  );
+  await rm(resolve(local.root, "secrets"), { recursive: true, force: true });
 }
 
-function secretDirectory(local, name) {
-  const target = resolve(local.syncedSecrets, name);
-  if (dirname(target) !== local.syncedSecrets) throw new Error("secret path escapes state directory");
-  return target;
-}
 
-function normaliseSecretEntries(name, entries) {
-  // A server predating key/value secrets sends one bare string per secret.
-  const values = typeof entries === "string" ? { value: entries } : entries;
-  if (!values || typeof values !== "object" || Array.isArray(values)) throw new Error(`secret ${name} must be a key/value map`);
-  const clean = {};
-  for (const [key, value] of Object.entries(values)) {
-    if (!SAFE_SECRET_KEY.test(key)) throw new Error(`unsafe secret key: ${name}.${key}`);
-    clean[key] = String(value);
-  }
-  return clean;
-}
+
+/**
+ * Apply the control plane's desired secret state.
+ *
+ * Every entry it writes is marked `sync: true`, which is what tells the agent-owned
+ * store that the control plane, not the user, is responsible for the copy.
+ */
+
+
+
+
 
 function isRuntimeEnvironmentKey(key) {
-  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(key) && !key.startsWith("ZIDANE_");
+  return (
+    /^[A-Za-z_][A-Za-z0-9_]*$/.test(key)
+    && !key.startsWith("ZIDANE_")
+    && !key.startsWith("AI_AGENT_")
+  );
 }
 
 async function atomicJson(target, value, mode = 0o644) {
@@ -199,23 +231,7 @@ async function atomicJson(target, value, mode = 0o644) {
 }
 
 /** Read one key out of an agent-owned secret directory. */
-export async function readAgentSecret(local, name, key) {
-  if (!/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(name)) throw new Error("unsafe secret name");
-  const directory = resolve(local.syncedSecrets, name);
-  if (dirname(directory) !== local.syncedSecrets) throw new Error("secret path escapes agent store");
-  let chosen = key;
-  if (!chosen) {
-    const files = (await readdir(directory, { withFileTypes: true }))
-      .filter((entry) => entry.isFile() && !entry.name.endsWith(".new"))
-      .map((entry) => entry.name);
-    if (files.length !== 1) throw new Error(`secret ${name} holds several keys; choose the one to use`);
-    chosen = files[0];
-  }
-  if (!/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(chosen)) throw new Error("unsafe secret key");
-  const target = resolve(directory, chosen);
-  if (dirname(target) !== directory) throw new Error("secret path escapes agent store");
-  return (await readFile(target, "utf8")).trim();
-}
+
 
 /**
  * Resolve the profile a prompt should run under.

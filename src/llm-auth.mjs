@@ -13,7 +13,7 @@ export class PiAuthManager {
     this.send = send;
     this.logger = logger;
     this.runtimeFactory = runtimeFactory ?? (() => ModelRuntime.create({
-      authPath: resolve(local.secrets, "pi-auth.json"),
+      authPath: resolve(local.auth, "pi-auth.json"),
       modelsPath: resolve(local.config, "models.json"),
       refreshOnCreate: false,
     }));

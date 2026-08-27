@@ -10,7 +10,7 @@ import { resolve } from "node:path";
  */
 export async function loadModelCatalog(local) {
   const runtime = await ModelRuntime.create({
-    authPath: resolve(local.secrets, "pi-auth.json"),
+    authPath: resolve(local.auth, "pi-auth.json"),
     modelsPath: resolve(local.config, "models.json"),
     refreshOnCreate: false,
   });

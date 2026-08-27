@@ -3,7 +3,10 @@ import { cp, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promi
 import { relative, resolve } from "node:path";
 import * as tar from "tar";
 
-const ROOTS = ["agent.json", "SOUL.md", "skills", "memory", "knowledge", "config"];
+const ROOTS = ["agent.json", "SOUL.md", "skills", "memory", "knowledge", "config", "config-maps"];
+// `config-maps` travels, but the secret values seeded into the environment from
+// `config-maps/.env` never do: a portable archive carries configuration, not credentials.
+const EXCLUDED = new Set(["config-maps/.env"]);
 const MAX_FILE_BYTES = 50 * 1024 * 1024;
 
 export async function exportAgent(local, filename) {
@@ -38,7 +41,7 @@ export async function importAgent(local, archive, mode = "validate") {
     await tar.extract({ file: archive, cwd: stage, preservePaths: false });
     const manifest = JSON.parse(await readFile(resolve(stage, "manifest.json"), "utf8"));
     for (const item of manifest.files ?? []) {
-      if (unsafe(item.path) || !ROOTS.some((root) => item.path === root || item.path.startsWith(`${root}/`))) throw new Error(`invalid manifest path: ${item.path}`);
+      if (unsafe(item.path) || EXCLUDED.has(item.path) || !ROOTS.some((root) => item.path === root || item.path.startsWith(`${root}/`))) throw new Error(`invalid manifest path: ${item.path}`);
       const data = await readFile(resolve(stage, item.path));
       if (createHash("sha256").update(data).digest("hex") !== item.sha256) throw new Error(`checksum mismatch: ${item.path}`);
     }
@@ -58,7 +61,9 @@ async function collect(path, root, files) {
   let info; try { info = await stat(path); } catch { return; }
   if (info.isDirectory()) { for (const name of await readdir(path)) await collect(resolve(path, name), root, files); return; }
   if (!info.isFile() || info.size > MAX_FILE_BYTES) throw new Error(`unsafe export entry: ${path}`);
+  const relativePath = relative(root, path).split("\\").join("/");
+  if (EXCLUDED.has(relativePath)) return;
   const data = await readFile(path);
-  files.push({ path: relative(root, path), sha256: createHash("sha256").update(data).digest("hex"), size: info.size });
+  files.push({ path: relativePath, sha256: createHash("sha256").update(data).digest("hex"), size: info.size });
 }
 function unsafe(path) { return path.startsWith("/") || path.split(/[\\/]/).includes(".."); }

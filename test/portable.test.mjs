@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { test } from "node:test";
@@ -14,13 +14,15 @@ test("portable archives round-trip state and exclude secrets and sessions", asyn
     const target = await initialise({ name: "target", version: "1", description: "target", workingDirectory: targetRoot });
     await writeFile(source.soul, "# Soul\n\nBe exact.\n");
     await writeFile(resolve(source.memory, "memory.json"), "[]");
-    await writeFile(resolve(source.secrets, "must-not-export"), "secret", { mode: 0o600 });
+    await mkdir(source.configMaps, { recursive: true });
+    await writeFile(resolve(source.configMaps, ".env"), "MUST_NOT_EXPORT=secret\n", { mode: 0o600 });
     await writeFile(resolve(source.sessions, "must-not-export.json"), "[]");
 
     const exported = await exportAgent(source, "portable.tar.gz");
     const entries = await validateArchive(exported.archive);
     assert.ok(entries.some((entry) => entry.path === "SOUL.md"));
-    assert.ok(entries.every((entry) => !entry.path.startsWith("secrets/")));
+    // Secret values live in config-maps/.env and must never enter an archive.
+    assert.ok(entries.every((entry) => entry.path !== "config-maps/.env"));
     assert.ok(entries.every((entry) => !entry.path.startsWith("sessions/")));
 
     const result = await importAgent(target, exported.archive, "replace");

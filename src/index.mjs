@@ -49,6 +49,12 @@ function send(type, fields = {}) {
 const logger = new AgentLogger(local, (level, message, fields) => {
   if (agentId) send("LOG", { level, message, fields });
 });
+// The resolved layout, so `docker logs` shows the truth even when the image's baked
+// AI_AGENT_*_FOLDER defaults were built against a different working directory.
+logger.log("info", "agent storage ready", {
+  working_directory: local.root,
+  config_maps: process.env.AI_AGENT_CONFIG_MAPS_FOLDER,
+});
 const memory = new MemoryStore(local);
 const runtime = new PiRuntime(config, local, send, logger, memory);
 const knowledge = new KnowledgeManager(local, send, logger);

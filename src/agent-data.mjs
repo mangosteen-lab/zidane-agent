@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, relative, resolve } from "node:path";
 import { applyConfigValues } from "./config.mjs";
+import { readEnvFile, writeEnvFile, SAFE_ENV_KEY } from "./dotenv.mjs";
 
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$/;
 const LLM_APIS = new Set(["openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai"]);
@@ -15,8 +16,6 @@ export class AgentDataStore {
 
   constructor(local) {
     this.local = local;
-    this.configDirectory = resolve(local.config, "agent-config-maps");
-    this.secretMetadata = resolve(local.config, "agent-secrets.json");
     this.profileDirectory = resolve(local.config, "llm-profiles");
     this.defaultProfileFile = resolve(local.config, "default-llm-profile.json");
   }
@@ -34,17 +33,12 @@ export class AgentDataStore {
     if (operation === "skill.update") return { item: await this.#updateSkill(input) };
     if (operation === "skill.delete") return { deleted: await this.#deleteSkill(input.skill_id) };
     if (operation === "skill.import") return { items: await this.#importSkills(input.items) };
-    if (operation === "config.list") return { items: (await this.#loadConfigs()).map(publicConfigSummary) };
+    if (operation === "config.list") return { items: (await this.#loadConfigs()).map((item) => publicConfig(item)) };
     if (operation === "config.get") return { item: await this.#getConfig(input.config_id) };
     if (operation === "config.create") return { item: await this.#createConfig(input) };
     if (operation === "config.update") return { item: await this.#updateConfig(input) };
     if (operation === "config.delete") return { deleted: await this.#deleteConfig(input.config_id) };
     if (operation === "config.import") return { items: await this.#importConfigs(input.items) };
-    if (operation === "secret.list") return { items: (await this.#loadSecrets()).map(publicSecret) };
-    if (operation === "secret.create") return { item: await this.#createSecret(input) };
-    if (operation === "secret.update") return { item: await this.#updateSecret(input) };
-    if (operation === "secret.delete") return { deleted: await this.#deleteSecret(input.secret_id) };
-    if (operation === "secret.import") return { items: await this.#importSecrets(input.items) };
     if (operation === "llm.list") return { items: await this.#listProfiles() };
     if (operation === "llm.create") return { item: await this.#createProfile(input) };
     if (operation === "llm.update") return { item: await this.#updateProfile(input) };
@@ -179,354 +173,166 @@ export class AgentDataStore {
     return { updated, removed };
   }
 
+  /** Config maps used to live under `config/agent-config-maps/`. */
+  // ------------------------------------------------------------- config maps
+  //
+  // One JSON record per map, `config-maps/<name>.json`. A record carries its ordinary
+  // values inline and only the *names* of its secret values; the values themselves live
+  // in the environment, seeded from `config-maps/.env`, and never enter the record.
+
+  #configPath(name) {
+    const target = resolve(this.local.configMaps, `${validConfigName(name)}.json`);
+    if (dirname(target) !== this.local.configMaps) throw new Error("config map path escapes the store");
+    return target;
+  }
+
   async #loadConfigs() {
-    await mkdir(this.configDirectory, { recursive: true });
+    await mkdir(this.local.configMaps, { recursive: true });
     const items = [];
-    for (const entry of await readdir(this.configDirectory, { withFileTypes: true })) {
+    for (const entry of await readdir(this.local.configMaps, { withFileTypes: true })) {
       if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
-      const item = await readJson(resolve(this.configDirectory, entry.name), null);
-      if (item && SAFE_ID.test(String(item.id ?? "")) && item.values && typeof item.values === "object") items.push(item);
+      const name = entry.name.slice(0, -".json".length);
+      if (!SAFE_CONFIG_NAME.test(name)) continue;
+      const record = await readJson(resolve(this.local.configMaps, entry.name), null);
+      if (record) items.push(storedConfig(name, record));
     }
-    if (!items.length) {
-      const applied = await readJson(resolve(this.local.config, "applied.json"), null);
-      if (applied?.values && Object.keys(applied.values).length) {
-        const timestamp = Date.now();
-        const migrated = {
-          id: "legacy-applied",
-          name: "Previously applied configuration",
-          values: validValues(applied.values),
-          source: { scope: "legacy", id: String(applied.revision ?? "") },
-          created_at: timestamp,
-          updated_at: timestamp,
-        };
-        await this.#saveConfig(migrated);
-        items.push(migrated);
-      }
-    }
-    return items.sort((left, right) => left.created_at - right.created_at || left.id.localeCompare(right.id));
+    return items.sort((left, right) => left.created_at - right.created_at || left.name.localeCompare(right.name));
   }
 
-  async #saveConfig(item) {
-    if (!SAFE_ID.test(item.id)) throw new Error("invalid configuration id");
-    await mkdir(this.configDirectory, { recursive: true });
-    await atomicJson(resolve(this.configDirectory, `${item.id}.json`), item);
+  async #findConfig(name) {
+    const wanted = validConfigName(name);
+    return (await this.#loadConfigs()).find((item) => item.name === wanted);
   }
 
-  async #materializeConfigs(items) {
+  /** The merged effective configuration, in creation order. */
+  async #applyConfigs() {
+    const items = await this.#loadConfigs();
     const values = {};
-    for (const item of items.sort((left, right) => left.created_at - right.created_at || left.id.localeCompare(right.id))) {
-      Object.assign(values, item.values);
-    }
+    for (const item of items) Object.assign(values, item.normal_values);
     await applyConfigValues(this.local, `agent-config-${crypto.randomUUID()}`, values);
+    return items;
+  }
+
+  /** Write any supplied secret values into `.env`; a null keeps what is stored. */
+  async #applySecretEntries(entries) {
+    if (!entries || typeof entries !== "object" || Array.isArray(entries)) return;
+    const stored = await readEnvFile(this.local);
+    let changed = false;
+    for (const [key, value] of Object.entries(entries)) {
+      if (!SAFE_ENV_KEY.test(key)) throw new Error(`unsafe secret value name: ${key}`);
+      if (key.startsWith("ZIDANE_") || key.startsWith("AI_AGENT_")) throw new Error(`reserved secret value name: ${key}`);
+      if (value === null) continue;
+      stored[key] = String(value);
+      process.env[key] = String(value);
+      changed = true;
+    }
+    if (changed) await writeEnvFile(this.local, stored);
+  }
+
+  #configRecord(existing, input) {
+    const timestamp = Date.now();
+    return {
+      title: typeof input.title === "string" && input.title.trim() ? input.title.trim() : existing?.title ?? validConfigName(input.name),
+      description: typeof input.description === "string" ? input.description.slice(0, 2_000) : existing?.description ?? "",
+      normal_values: validValues(input.normal_values ?? {}),
+      secret_values: validSecretNames(input.secret_values, input.secret_entries),
+      sync: input.sync ?? existing?.sync ?? false,
+      source_id: input.source_id ?? existing?.source_id ?? null,
+      created_at: existing?.created_at ?? timestamp,
+      updated_at: timestamp,
+    };
+  }
+
+  async #writeConfig(name, record) {
+    await mkdir(this.local.configMaps, { recursive: true });
+    await atomicJson(this.#configPath(name), record, 0o600);
   }
 
   async #createConfig(input) {
-    const items = await this.#loadConfigs();
-    const timestamp = Date.now();
-    const item = {
-      id: crypto.randomUUID(),
-      name: validName(input.name, "configuration"),
-      values: validValues(input.values),
-      source: { scope: "agent" },
-      created_at: timestamp,
-      updated_at: timestamp,
-    };
-    await this.#saveConfig(item);
-    items.push(item);
-    await this.#materializeConfigs(items);
-    return publicConfig(item);
+    const name = validConfigName(input.name);
+    if (await this.#findConfig(name)) throw new Error("a config map with this name already exists");
+    await this.#applySecretEntries(input.secret_entries);
+    await this.#writeConfig(name, this.#configRecord(null, input));
+    await this.#applyConfigs();
+    return publicConfig(await this.#findConfig(name));
   }
 
-  async #getConfig(configIdValue) {
-    const configId = validId(configIdValue, "configuration");
-    const item = (await this.#loadConfigs()).find((candidate) => candidate.id === configId);
+  async #getConfig(nameValue) {
+    const item = await this.#findConfig(nameValue);
     if (!item) throw new Error("configuration not found");
-    return publicConfig(item);
+    return publicConfig(item, { includeValues: true });
   }
 
   async #updateConfig(input) {
-    const configId = validId(input.config_id, "configuration");
-    const items = await this.#loadConfigs();
-    const item = items.find((candidate) => candidate.id === configId);
-    if (!item) throw new Error("configuration not found");
-    item.name = validName(input.name, "configuration");
-    item.values = validValues(input.values);
-    item.updated_at = Date.now();
-    await this.#saveConfig(item);
-    await this.#materializeConfigs(items);
-    return publicConfig(item);
+    const current = await this.#findConfig(input.config_id);
+    if (!current) throw new Error("configuration not found");
+    const name = validConfigName(input.name);
+    if (name !== current.name && await this.#findConfig(name)) {
+      throw new Error("a config map with this name already exists");
+    }
+    await this.#applySecretEntries(input.secret_entries);
+    await this.#writeConfig(name, this.#configRecord(current, input));
+    if (name !== current.name) await rm(this.#configPath(current.name), { force: true });
+    await this.#applyConfigs();
+    return publicConfig(await this.#findConfig(name));
   }
 
-  async #deleteConfig(configIdValue) {
-    const configId = validId(configIdValue, "configuration");
-    const items = await this.#loadConfigs();
-    const kept = items.filter((item) => item.id !== configId);
-    if (kept.length === items.length) return false;
-    await rm(resolve(this.configDirectory, `${configId}.json`), { force: true });
-    await this.#materializeConfigs(kept);
+  async #deleteConfig(nameValue) {
+    const item = await this.#findConfig(nameValue);
+    if (!item) return false;
+    await rm(this.#configPath(item.name), { force: true });
+    await this.#applyConfigs();
     return true;
   }
 
   async #importConfigs(rawItems) {
     const incoming = Array.isArray(rawItems) ? rawItems : [];
     if (!incoming.length || incoming.length > 100) throw new Error("select between 1 and 100 configuration maps");
-    const items = await this.#loadConfigs();
     const imported = [];
     for (const raw of incoming) {
       const sourceId = validId(raw.source_id, "account configuration");
-      const existing = items.find((item) => item.source?.scope === "account" && item.source.id === sourceId);
-      const timestamp = Date.now();
-      const item = existing ?? {
-        id: crypto.randomUUID(),
-        source: { scope: "account", id: sourceId },
-        created_at: timestamp,
-      };
-      item.name = validName(raw.name, "configuration");
-      item.values = validValues(raw.values);
-      item.updated_at = timestamp;
-      if (!existing) items.push(item);
-      await this.#saveConfig(item);
-      imported.push(publicConfig(item));
+      const existing = (await this.#loadConfigs()).find((item) => item.source_id === sourceId);
+      const name = validConfigName(raw.name);
+      const clash = await this.#findConfig(name);
+      if (clash && clash.source_id !== sourceId) throw new Error(`a config map named ${name} already exists`);
+      await this.#writeConfig(name, this.#configRecord(existing, { ...raw, name, sync: true, source_id: sourceId }));
+      if (existing && existing.name !== name) await rm(this.#configPath(existing.name), { force: true });
+      imported.push(publicConfig(await this.#findConfig(name)));
     }
-    await this.#materializeConfigs(items);
+    await this.#applyConfigs();
     return imported;
   }
 
-  async #loadSecrets() {
-    await mkdir(this.local.syncedSecrets, { recursive: true });
-    await this.#migrateFlatSecrets();
-    const stored = await readJson(this.secretMetadata, []);
-    let items = Array.isArray(stored) ? stored : [];
-    const storedCount = items.length;
-    const directories = new Map();
-    for (const entry of await readdir(this.local.syncedSecrets, { withFileTypes: true })) {
-      if (!entry.isDirectory() || !SAFE_KEY.test(entry.name)) continue;
-      const directory = resolve(this.local.syncedSecrets, entry.name);
-      await chmod(directory, 0o700);
-      directories.set(entry.name, await secretKeys(directory));
-    }
-    items = items.filter((item) => SAFE_ID.test(String(item.id ?? "")) && SAFE_KEY.test(String(item.name ?? "")) && directories.has(item.name));
-    const knownNames = new Set(items.map((item) => item.name));
-    let changed = !Array.isArray(stored) || items.length !== storedCount;
-    for (const name of directories.keys()) {
-      if (knownNames.has(name)) continue;
-      const details = await stat(resolve(this.local.syncedSecrets, name));
-      items.push({
-        id: `legacy-${createHash("sha256").update(name).digest("hex").slice(0, 16)}`,
-        name,
-        source: { scope: "legacy" },
-        created_at: details.birthtimeMs || details.mtimeMs,
-        updated_at: details.mtimeMs,
-      });
-      changed = true;
-    }
-    if (changed) await this.#saveSecretMetadata(items);
-    return items
-      .map((item) => ({ ...item, keys: directories.get(item.name) ?? [] }))
-      .sort((left, right) => left.created_at - right.created_at || left.name.localeCompare(right.name));
-  }
-
-  /** A secret used to be one flat file; it is now a directory of key files. */
-  async #migrateFlatSecrets() {
-    for (const entry of await readdir(this.local.syncedSecrets, { withFileTypes: true })) {
-      if (!entry.isFile() || entry.name.endsWith(".new") || !SAFE_KEY.test(entry.name)) continue;
-      const flat = resolve(this.local.syncedSecrets, entry.name);
-      const value = await readFile(flat, "utf8");
-      await rm(flat, { force: true });
-      await this.#writeSecretEntries(entry.name, { value });
-    }
-  }
-
-  async #saveSecretMetadata(items) {
-    await atomicJson(this.secretMetadata, items.map(({ keys: _keys, ...item }) => item), 0o600);
-  }
-
-  #secretDirectory(name) {
-    const target = resolve(this.local.syncedSecrets, name);
-    if (dirname(target) !== this.local.syncedSecrets) throw new Error("secret path escapes agent store");
-    return target;
-  }
-
-  /** Replace every null with the value already stored under `name`. */
-  async #resolveKeptValues(name, values) {
-    const directory = this.#secretDirectory(name);
-    const resolved = {};
-    for (const [key, value] of Object.entries(values)) {
-      if (value !== null) {
-        resolved[key] = value;
-        continue;
-      }
-      try {
-        resolved[key] = await readFile(resolve(directory, key), "utf8");
-      } catch {
-        throw new Error(`there is no stored value to keep for ${key}`);
-      }
-    }
-    return resolved;
-  }
-
-  /** Write every key and drop the ones this revision no longer carries. */
-  async #writeSecretEntries(name, values) {
-    const directory = this.#secretDirectory(name);
-    await mkdir(directory, { recursive: true });
-    await chmod(directory, 0o700);
-    for (const key of await secretKeys(directory)) {
-      if (!(key in values)) await rm(resolve(directory, key), { force: true });
-    }
-    for (const [key, value] of Object.entries(values)) {
-      const target = resolve(directory, key);
-      const pending = `${target}.new`;
-      await writeFile(pending, value, { mode: 0o600 });
-      await rename(pending, target);
-      await chmod(target, 0o600);
-    }
-  }
-
-  async #createSecret(input) {
-    const items = await this.#loadSecrets();
-    const name = validSecretName(input.name);
-    if (items.some((item) => item.name === name)) throw new Error("an agent secret with this name already exists");
-    const values = validSecretValues(input.values);
-    const timestamp = Date.now();
-    const item = { id: crypto.randomUUID(), name, source: { scope: "agent" }, created_at: timestamp, updated_at: timestamp };
-    await this.#writeSecretEntries(name, values);
-    items.push(item);
-    await this.#saveSecretMetadata(items);
-    return publicSecret({ ...item, keys: Object.keys(values).sort() });
-  }
-
-  async #updateSecret(input) {
-    const secretId = validId(input.secret_id, "secret");
-    const items = await this.#loadSecrets();
-    const item = items.find((candidate) => candidate.id === secretId);
-    if (!item) throw new Error("secret not found");
-    const name = validSecretName(input.name);
-    if (items.some((candidate) => candidate.id !== secretId && candidate.name === name)) throw new Error("an agent secret with this name already exists");
-    const values = await this.#resolveKeptValues(
-      item.name,
-      validSecretValues(input.values, { allowKept: true }),
-    );
-    const oldName = item.name;
-    await this.#writeSecretEntries(name, values);
-    item.name = name;
-    item.keys = Object.keys(values).sort();
-    item.updated_at = Date.now();
-    await this.#saveSecretMetadata(items);
-    if (oldName !== name) await rm(this.#secretDirectory(oldName), { recursive: true, force: true });
-    return publicSecret(item);
-  }
-
-  async #deleteSecret(secretIdValue) {
-    const secretId = validId(secretIdValue, "secret");
-    const items = await this.#loadSecrets();
-    const item = items.find((candidate) => candidate.id === secretId);
-    if (!item) return false;
-    await rm(this.#secretDirectory(item.name), { recursive: true, force: true });
-    await this.#saveSecretMetadata(items.filter((candidate) => candidate.id !== secretId));
-    return true;
-  }
-
-  async #importSecrets(rawItems) {
-    const incoming = Array.isArray(rawItems) ? rawItems : [];
-    if (!incoming.length || incoming.length > 100) throw new Error("select between 1 and 100 secrets");
-    const items = await this.#loadSecrets();
-    const planned = items.map((item) => ({ ...item, source: { ...item.source } }));
-    const changes = [];
-    for (const raw of incoming) {
-      const sourceId = validId(raw.source_id, "account secret");
-      const name = validSecretName(raw.name);
-      const existing = planned.find((item) => item.source?.scope === "account" && item.source.id === sourceId);
-      const timestamp = Date.now();
-      const item = existing ?? { id: crypto.randomUUID(), source: { scope: "account", id: sourceId }, created_at: timestamp };
-      if (planned.some((candidate) => candidate.id !== item.id && candidate.name === name)) {
-        throw new Error(`an agent secret named ${name} already exists`);
-      }
-      const oldName = existing?.name;
-      item.name = name;
-      item.updated_at = timestamp;
-      if (!existing) planned.push(item);
-      changes.push({ item, oldName, values: validSecretValues(raw.values) });
-    }
-    for (const change of changes) {
-      await this.#writeSecretEntries(change.item.name, change.values);
-      change.item.keys = Object.keys(change.values).sort();
-    }
-    await this.#saveSecretMetadata(planned);
-    for (const change of changes) {
-      if (change.oldName && change.oldName !== change.item.name) {
-        await rm(this.#secretDirectory(change.oldName), { recursive: true, force: true });
-      }
-      change.values = {};
-    }
-    return changes.map((change) => publicSecret(change.item));
-  }
-
-  /** Re-apply the account resources this agent may still see, and drop the rest. */
   async #refreshAccountResources(input) {
     return {
       skills: await this.#refreshAccountSkills(Array.isArray(input.skills) ? input.skills : []),
       configs: await this.#refreshAccountConfigs(Array.isArray(input.configs) ? input.configs : []),
-      secrets: await this.#refreshAccountSecrets(Array.isArray(input.secrets) ? input.secrets : []),
     };
   }
 
   async #refreshAccountConfigs(incoming) {
     const allowed = new Map(incoming.map((raw) => [validId(raw.source_id, "account configuration"), raw]));
-    const kept = [];
     let updated = 0;
     let removed = 0;
     for (const item of await this.#loadConfigs()) {
-      if (item.source?.scope !== "account") { kept.push(item); continue; }
-      const raw = allowed.get(item.source.id);
+      // Only synced copies are ours to touch; a hand-made map is left alone.
+      if (!item.sync || !item.source_id) continue;
+      const raw = allowed.get(item.source_id);
       if (!raw) {
-        await rm(resolve(this.configDirectory, `${item.id}.json`), { force: true });
+        await rm(this.#configPath(item.name), { force: true });
         removed += 1;
         continue;
       }
-      item.name = validName(raw.name, "configuration");
-      item.values = validValues(raw.values);
-      item.updated_at = Date.now();
-      await this.#saveConfig(item);
+      const name = validConfigName(raw.name);
+      const clash = await this.#findConfig(name);
+      if (clash && clash.source_id !== item.source_id) throw new Error(`a config map named ${name} already exists`);
+      await this.#writeConfig(name, this.#configRecord(item, { ...raw, name, sync: true, source_id: item.source_id }));
+      if (item.name !== name) await rm(this.#configPath(item.name), { force: true });
       updated += 1;
-      kept.push(item);
     }
-    if (updated || removed) await this.#materializeConfigs(kept);
+    if (updated || removed) await this.#applyConfigs();
     return { updated, removed };
   }
-
-  async #refreshAccountSecrets(incoming) {
-    const allowed = new Map(incoming.map((raw) => [validId(raw.source_id, "account secret"), raw]));
-    const items = await this.#loadSecrets();
-    const kept = [];
-    let updated = 0;
-    let removed = 0;
-    for (const item of items) {
-      if (item.source?.scope !== "account") { kept.push(item); continue; }
-      const raw = allowed.get(item.source.id);
-      if (!raw) {
-        await rm(this.#secretDirectory(item.name), { recursive: true, force: true });
-        removed += 1;
-        continue;
-      }
-      const name = validSecretName(raw.name);
-      // A rename must not land on any other secret, including one not yet visited.
-      if (items.some((candidate) => candidate.id !== item.id && candidate.name === name)) {
-        throw new Error(`an agent secret named ${name} already exists`);
-      }
-      const values = validSecretValues(raw.values);
-      const oldName = item.name;
-      await this.#writeSecretEntries(name, values);
-      if (oldName !== name) await rm(this.#secretDirectory(oldName), { recursive: true, force: true });
-      item.name = name;
-      item.keys = Object.keys(values).sort();
-      item.updated_at = Date.now();
-      updated += 1;
-      kept.push(item);
-    }
-    await this.#saveSecretMetadata(kept);
-    return { updated, removed };
-  }
-
 
   // ------------------------------------------------------------ LLM profiles
   //
@@ -587,24 +393,17 @@ export class AgentDataStore {
     if (!THINKING_LEVELS.has(thinkingLevel)) throw new Error(`unsupported thinking level: ${thinkingLevel}`);
     const tools = Array.isArray(input.tools) ? input.tools.slice(0, 32).map((tool) => String(tool)) : [];
 
-    let secretName = null;
-    let secretKey = null;
-    if (input.secret_name) {
-      secretName = validSecretName(input.secret_name);
-      const secret = (await this.#loadSecrets()).find((item) => item.name === secretName);
-      if (!secret) throw new Error(`this agent has no secret named ${secretName}`);
-      if (input.secret_key) {
-        secretKey = String(input.secret_key);
-        if (!secret.keys.includes(secretKey)) throw new Error(`secret ${secretName} has no key named ${secretKey}`);
-      } else if (secret.keys.length === 1) {
-        secretKey = secret.keys[0];
-      } else {
-        throw new Error(`secret ${secretName} holds several keys; choose the one to use`);
+    let secretValue = null;
+    if (input.secret_value) {
+      secretValue = String(input.secret_value);
+      if (!SAFE_ENV_KEY.test(secretValue)) throw new Error(`unsafe secret value name: ${secretValue}`);
+      // Declared by some config map, or supplied straight through the environment.
+      const declared = (await this.#loadConfigs()).some((item) => item.secret_values.includes(secretValue));
+      if (!declared && process.env[secretValue] === undefined) {
+        throw new Error(`no config map declares ${secretValue}, and it is not in the environment`);
       }
-    } else if (input.secret_key) {
-      throw new Error("choose a secret before a key");
     }
-    return { name, provider, model, secret_name: secretName, secret_key: secretKey, base_url: baseUrl, api, thinking_level: thinkingLevel, tools };
+    return { name, provider, model, secret_value: secretValue, base_url: baseUrl, api, thinking_level: thinkingLevel, tools };
   }
 
   /** A custom endpoint has to reach Pi's own model store to be selectable. */
@@ -734,6 +533,31 @@ function validContent(value) {
   return content;
 }
 
+const SAFE_CONFIG_NAME = /^[A-Za-z_][A-Za-z0-9_.-]{0,119}$/;
+
+function validConfigName(value) {
+  const name = String(value ?? "").trim();
+  if (!SAFE_CONFIG_NAME.test(name)) throw new Error("config map name must be a safe 1 to 120 character key");
+  return name;
+}
+
+/** The declared secret value names, including any the caller supplied a value for. */
+function validSecretNames(declared, entries) {
+  const names = new Set();
+  for (const key of Array.isArray(declared) ? declared : []) {
+    const name = String(key);
+    if (!SAFE_ENV_KEY.test(name)) throw new Error(`unsafe secret value name: ${name}`);
+    if (name.startsWith("ZIDANE_") || name.startsWith("AI_AGENT_")) throw new Error(`reserved secret value name: ${name}`);
+    names.add(name);
+  }
+  for (const key of Object.keys(entries ?? {})) {
+    if (!SAFE_ENV_KEY.test(key)) throw new Error(`unsafe secret value name: ${key}`);
+    names.add(key);
+  }
+  if (names.size > 500) throw new Error("a config map cannot declare more than 500 secret values");
+  return [...names].sort();
+}
+
 function validValues(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("configuration values must be an object");
   const entries = Object.entries(value);
@@ -750,33 +574,7 @@ function validValues(value) {
   return clean;
 }
 
-function validSecretName(value) {
-  const name = String(value ?? "").trim();
-  if (!SAFE_KEY.test(name) || name.length > 120) throw new Error("secret name must be a safe 1 to 120 character key");
-  return name;
-}
 
-/** With `allowKept`, a null value survives as null and means "keep what is stored". */
-function validSecretValues(value, { allowKept = false } = {}) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("secret values must be a key/value map");
-  const entries = Object.entries(value);
-  if (!entries.length) throw new Error("a secret needs at least one key");
-  if (entries.length > 500) throw new Error("a secret cannot hold more than 500 keys");
-  const clean = {};
-  let size = 0;
-  for (const [key, item] of entries) {
-    if (!SAFE_KEY.test(key) || key.length > 120) throw new Error(`unsafe secret key: ${key}`);
-    if (allowKept && item === null) {
-      clean[key] = null;
-      continue;
-    }
-    const secret = String(item ?? "");
-    size += Buffer.byteLength(secret);
-    if (!secret || size > MAX_VALUE_BYTES) throw new Error("secret values must contain 1 to 1000000 bytes");
-    clean[key] = secret;
-  }
-  return clean;
-}
 
 async function secretKeys(directory) {
   const entries = await readdir(directory, { withFileTypes: true });
@@ -801,20 +599,46 @@ function publicSkill(item) {
   };
 }
 
-function publicConfig(item) {
+/** Normalise one stored record; unknown or malformed fields read as empty. */
+function storedConfig(name, record) {
+  const normal = record.normal_values && typeof record.normal_values === "object" && !Array.isArray(record.normal_values)
+    ? record.normal_values
+    : {};
+  const secrets = Array.isArray(record.secret_values) ? record.secret_values.filter((key) => SAFE_ENV_KEY.test(String(key))) : [];
   return {
-    config_id: item.id,
-    name: item.name,
-    values: item.values,
-    source: item.source ?? { scope: "agent" },
-    created_at: item.created_at,
-    updated_at: item.updated_at,
+    name,
+    title: typeof record.title === "string" && record.title.trim() ? record.title.trim() : name,
+    description: typeof record.description === "string" ? record.description : "",
+    normal_values: Object.fromEntries(Object.entries(normal).map(([key, value]) => [key, String(value)])),
+    secret_values: [...new Set(secrets.map(String))].sort(),
+    sync: record.sync === true,
+    source_id: typeof record.source_id === "string" && record.source_id ? record.source_id : null,
+    created_at: Number(record.created_at) || 0,
+    updated_at: Number(record.updated_at) || 0,
   };
 }
 
-function publicConfigSummary(item) {
-  const { values: _values, ...summary } = publicConfig(item);
-  return { ...summary, keys: Object.keys(item.values).sort(), entry_count: Object.keys(item.values).length };
+/**
+ * A config map as the control plane sees it.
+ *
+ * `secret_values` reports each declared name and whether a value is actually resolvable
+ * right now — never the value itself.
+ */
+function publicConfig(item, { includeValues = false } = {}) {
+  return {
+    config_id: item.name,
+    name: item.name,
+    title: item.title,
+    description: item.description,
+    ...(includeValues ? { normal_values: item.normal_values } : {}),
+    normal_keys: Object.keys(item.normal_values).sort(),
+    secret_values: item.secret_values.map((key) => ({ key, resolved: process.env[key] !== undefined && process.env[key] !== "" })),
+    entry_count: Object.keys(item.normal_values).length + item.secret_values.length,
+    sync: item.sync,
+    source_id: item.source_id,
+    created_at: item.created_at,
+    updated_at: item.updated_at,
+  };
 }
 
 /** Never carries a credential: a profile only ever names the secret to read. */
@@ -824,8 +648,7 @@ function publicProfile(profile, defaultId) {
     name: profile.name,
     provider: profile.provider,
     model: profile.model,
-    secret_name: profile.secret_name ?? null,
-    secret_key: profile.secret_key ?? null,
+    secret_value: profile.secret_value ?? null,
     base_url: profile.base_url ?? null,
     api: profile.api ?? null,
     thinking_level: profile.thinking_level ?? "medium",
@@ -836,18 +659,6 @@ function publicProfile(profile, defaultId) {
   };
 }
 
-function publicSecret(item) {
-  const keys = item.keys ?? [];
-  return {
-    secret_id: item.id,
-    name: item.name,
-    keys,
-    entry_count: keys.length,
-    source: item.source ?? { scope: "agent" },
-    created_at: item.created_at,
-    updated_at: item.updated_at,
-  };
-}
 
 async function readJson(path, fallback) {
   try { return JSON.parse(await readFile(path, "utf8")); }

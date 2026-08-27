@@ -137,7 +137,7 @@ export class KnowledgeManager {
   }
 
   #credentialPath(sourceId) {
-    return resolve(this.local.secrets, `knowledge-${sourceId}`);
+    return resolve(this.local.auth, `knowledge-${sourceId}`);
   }
 }
 

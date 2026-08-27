@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
-import { readAgentSecret, resolveLlmProfile } from "./config.mjs";
+import { readSecretValue, resolveLlmProfile } from "./config.mjs";
 import { contextTools } from "./context-tools.mjs";
 
 export class PiRuntime {
@@ -41,9 +41,9 @@ export class PiRuntime {
     let profile = {};
     try { profile = await resolveLlmProfile(this.local, delivery.profile_id); }
     catch { profile = {}; }
-    const runtime = await ModelRuntime.create({ authPath: resolve(this.local.secrets, "pi-auth.json"), modelsPath: resolve(this.local.config, "models.json") });
-    if (profile.provider && profile.secret_name) {
-      await runtime.setRuntimeApiKey(profile.provider, await readAgentSecret(this.local, profile.secret_name, profile.secret_key));
+    const runtime = await ModelRuntime.create({ authPath: resolve(this.local.auth, "pi-auth.json"), modelsPath: resolve(this.local.config, "models.json") });
+    if (profile.provider && profile.secret_value) {
+      await runtime.setRuntimeApiKey(profile.provider, readSecretValue(profile.secret_value));
     }
     const soul = await readFile(this.local.soul, "utf8");
     const loader = new DefaultResourceLoader({
