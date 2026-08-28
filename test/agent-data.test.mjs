@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { test } from "node:test";
-import { AgentDataStore } from "../src/agent-data.mjs";
+import { AgentDataStore, skillIdentity, withSkillIdentity } from "../src/agent-data.mjs";
 import { initialise } from "../src/config.mjs";
 
 test("agent-owned skills and config maps support local CRUD and account imports", async () => {
@@ -117,6 +117,99 @@ test("agent-owned skills and config maps support local CRUD and account imports"
   } finally {
     delete process.env[environmentKey];
     delete process.env.IMPORTED_SETTING;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a skill's frontmatter carries the identity, and the file is what is believed", () => {
+  const skill = "---\nname: deploy\ndescription: Ship it\n---\n\n# Deploy\n";
+  assert.equal(skillIdentity(skill), "");
+  assert.equal(skillIdentity("---\nid: abc-123\nname: deploy\n---\nbody\n"), "abc-123");
+  assert.equal(skillIdentity('---\nid: "quoted-1"\n---\n'), "quoted-1");
+  // Nothing that could be mistaken for a path or an injection is accepted as an id.
+  assert.equal(skillIdentity("---\nid: ../../etc/passwd\n---\n"), "");
+  assert.equal(skillIdentity("# No frontmatter\nid: nope\n"), "");
+
+  // Stamping is idempotent and leaves the rest of the block alone.
+  const stamped = withSkillIdentity(skill, "skill-1");
+  assert.equal(skillIdentity(stamped), "skill-1");
+  assert.match(stamped, /name: deploy/);
+  assert.match(stamped, /# Deploy/);
+  assert.equal(withSkillIdentity(stamped, "skill-1"), stamped);
+  // A different id replaces the one declared rather than adding a second line.
+  const restamped = withSkillIdentity(stamped, "skill-2");
+  assert.equal(skillIdentity(restamped), "skill-2");
+  assert.equal(restamped.match(/^id:/gm).length, 1);
+  // A file with no frontmatter gets one, and keeps its body.
+  const bare = withSkillIdentity("# Just a body\n", "skill-3");
+  assert.equal(skillIdentity(bare), "skill-3");
+  assert.match(bare, /# Just a body/);
+});
+
+test("the same skill is recognisable between the agent and the account", async () => {
+  const root = await mkdtemp(resolve(tmpdir(), "zidane-skill-identity-test-"));
+  try {
+    const local = await initialise({ name: "test", version: "1", description: "", capacity: 1, workingDirectory: root });
+    const store = new AgentDataStore(local);
+
+    // A skill created without an id is given one, and it is written into the file.
+    const minted = (await store.handle("skill.create", {
+      name: "Release notes",
+      content: "---\nname: release-notes\ndescription: Write release notes\n---\n\n# Release notes\n",
+    })).item;
+    assert.equal(skillIdentity(minted.content), minted.skill_id);
+    assert.equal(
+      skillIdentity(await readFile(resolve(local.skills, "release-notes", "SKILL.md"), "utf8")),
+      minted.skill_id,
+    );
+
+    // One that arrives carrying an id keeps it: that is what makes a restored export or
+    // a copy promoted to the account the same skill rather than a look-alike.
+    const carried = (await store.handle("skill.create", {
+      name: "Triage",
+      content: "---\nid: shared-identity-1\nname: triage\ndescription: Triage a page\n---\n\n# Triage\n",
+    })).item;
+    assert.equal(carried.skill_id, "shared-identity-1");
+
+    // An id already in use here is not transferable by pasting it.
+    const impostor = (await store.handle("skill.create", {
+      name: "Impostor",
+      content: "---\nid: shared-identity-1\nname: impostor\ndescription: Not triage\n---\n",
+    })).item;
+    assert.notEqual(impostor.skill_id, "shared-identity-1");
+    assert.equal(skillIdentity(impostor.content), impostor.skill_id);
+    assert.match((await store.handle("skill.get", { skill_id: "shared-identity-1" })).item.content, /# Triage/);
+
+    // Editing cannot drop the identity or rebind it to another skill.
+    const edited = (await store.handle("skill.update", {
+      skill_id: carried.skill_id,
+      name: "Triage",
+      content: "---\nid: someone-elses-id\nname: triage\ndescription: Triage a page\n---\n\n# Triage v2\n",
+    })).item;
+    assert.equal(edited.skill_id, "shared-identity-1");
+    assert.equal(skillIdentity(edited.content), "shared-identity-1");
+
+    // The account now shares a skill this agent already holds under the same identity —
+    // the copy is updated in place instead of a twin appearing beside it.
+    const sync = await store.handle("account.refresh", {
+      skills: [{ source_id: "shared-identity-1", name: "Triage", content: "# Triage v3\n" }],
+      configs: [],
+    });
+    assert.deepEqual(sync.skills, { created: 0, updated: 1, removed: 0 });
+    const adopted = (await store.handle("skill.list")).items.filter((item) => item.skill_id === "shared-identity-1");
+    assert.equal(adopted.length, 1);
+    assert.deepEqual(adopted[0].source, { scope: "account", id: "shared-identity-1" });
+    const stored = (await store.handle("skill.get", { skill_id: "shared-identity-1" })).item;
+    assert.match(stored.content, /# Triage v3/);
+    assert.equal(skillIdentity(stored.content), "shared-identity-1");
+
+    // A hand-placed skill is still nobody's copy: a sync leaves it exactly where it is.
+    const manual = resolve(local.skills, "hand-placed");
+    await mkdir(manual, { recursive: true });
+    await writeFile(resolve(manual, "SKILL.md"), "---\nname: hand-placed\ndescription: Mine\n---\n");
+    await store.handle("account.refresh", { skills: [], configs: [] });
+    assert.equal((await readFile(resolve(manual, "SKILL.md"), "utf8")).includes("id:"), false);
+  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });

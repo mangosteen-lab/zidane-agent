@@ -5,10 +5,52 @@ import { applyConfigValues } from "./config.mjs";
 import { readEnvFile, writeEnvFile, SAFE_ENV_KEY } from "./dotenv.mjs";
 
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$/;
+const FRONTMATTER = /^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/;
 const LLM_APIS = new Set(["openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai"]);
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const SAFE_KEY = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
 const MAX_VALUE_BYTES = 1_000_000;
+
+/**
+ * A skill's identity, which travels in the file.
+ *
+ * An account row, an agent's copy, a file in a git branch, and something pasted into the
+ * editor are all the same skill when they carry the same `id:` in their frontmatter —
+ * the way a knowledge article already works. Reconcilers can then ask "is this the same
+ * one?" without matching on a name that someone is going to rename, and `.zidane.json`
+ * holds only what a file cannot (its source, its timestamps) and is rebuildable from it.
+ *
+ * Pi reads `name`, `description`, and `disable-model-invocation` from this block and
+ * ignores everything else, so an `id` line changes nothing about how a skill loads.
+ */
+export function skillIdentity(content) {
+  const block = FRONTMATTER.exec(String(content ?? ""));
+  if (!block) return "";
+  for (const line of block[1].split(/\r?\n/)) {
+    const separator = line.indexOf(":");
+    if (separator < 1 || line.slice(0, separator).trim() !== "id") continue;
+    const value = line.slice(separator + 1).trim().replace(/^["']|["']$/g, "");
+    return SAFE_ID.test(value) ? value : "";
+  }
+  return "";
+}
+
+/** The same content, declaring `id`. Whatever it declared before does not survive. */
+export function withSkillIdentity(content, id) {
+  const text = String(content ?? "");
+  const block = FRONTMATTER.exec(text);
+  // A file with no frontmatter declares no description either, so Pi already skips it;
+  // a block holding just the id leaves it no worse off and keeps the id with the content.
+  if (!block) return `---\nid: ${id}\n---\n${text}`;
+  const lines = block[1].split(/\r?\n/);
+  const at = lines.findIndex((line) => {
+    const separator = line.indexOf(":");
+    return separator > 0 && line.slice(0, separator).trim() === "id";
+  });
+  if (at >= 0) lines[at] = `id: ${id}`;
+  else lines.unshift(`id: ${id}`);
+  return `---\n${lines.join("\n")}\n---\n${text.slice(block[0].length)}`;
+}
 
 /** Agent-owned CRUD store for Pi skills, config maps, secrets, and LLM profiles. */
 export class AgentDataStore {
@@ -62,7 +104,7 @@ export class AgentDataStore {
   }
 
   async #listSkills() {
-    return (await this.#skillEntries()).map(({ directory: _directory, managed: _managed, content, ...item }) => ({
+    return (await this.#skillEntries()).map(({ directory: _directory, managed: _managed, identity: _identity, content, ...item }) => ({
       ...item,
       size_bytes: Buffer.byteLength(content),
     }));
@@ -91,17 +133,24 @@ export class AgentDataStore {
     await mkdir(this.local.skills, { recursive: true });
     const name = validName(input.name, "skill");
     const content = validContent(input.content);
+    // A skill arriving with an id keeps it, which is what makes a paste, a restored
+    // export, and a promoted copy the same skill. One already in use here does not
+    // transfer: an id is asserted by whoever mints it, never by pasted content.
+    const declared = skillIdentity(content);
+    const taken = new Set((await this.#skillEntries()).map((entry) => entry.skill_id));
+    const id = declared && !taken.has(declared) ? declared : crypto.randomUUID();
     const directory = await this.#skillDirectory(name);
     const timestamp = Date.now();
-    const metadata = { id: crypto.randomUUID(), name, source: { scope: "agent" }, created_at: timestamp, updated_at: timestamp };
-    await this.#writeSkill(directory, metadata, content);
-    return publicSkill({ ...metadata, content });
+    const metadata = { id, name, source: { scope: "agent" }, created_at: timestamp, updated_at: timestamp };
+    const body = withSkillIdentity(content, id);
+    await this.#writeSkill(directory, metadata, body);
+    return publicSkill({ ...metadata, content: body });
   }
 
   async #getSkill(skillId) {
     const entry = (await this.#skillEntries()).find((item) => item.skill_id === String(skillId ?? ""));
     if (!entry) throw new Error("skill not found");
-    const { directory: _directory, managed: _managed, ...item } = entry;
+    const { directory: _directory, managed: _managed, identity: _identity, ...item } = entry;
     return item;
   }
 
@@ -111,15 +160,20 @@ export class AgentDataStore {
     const name = validName(input.name, "skill");
     const content = validContent(input.content);
     const timestamp = Date.now();
+    // The record's own id is written back over whatever the submitted content declares,
+    // so editing a skill can neither drop its identity nor rebind it to another one. A
+    // hand-placed file that has never had one is given one here, on its first write.
+    const id = entry.identity || crypto.randomUUID();
     const metadata = {
-      id: entry.skill_id,
+      id,
       name,
       source: entry.source,
       created_at: entry.created_at,
       updated_at: timestamp,
     };
-    await this.#writeSkill(entry.directory, metadata, content);
-    return publicSkill({ ...metadata, content });
+    const body = withSkillIdentity(content, id);
+    await this.#writeSkill(entry.directory, metadata, body);
+    return publicSkill({ ...metadata, content: body });
   }
 
   async #deleteSkill(skillId) {
@@ -137,50 +191,52 @@ export class AgentDataStore {
 
   async #refreshAccountSkills(incoming) {
     const allowed = new Map(incoming.map((raw) => [validId(raw.source_id, "account skill"), raw]));
-    const seen = new Set();
     let created = 0;
     let updated = 0;
     let removed = 0;
     await mkdir(this.local.skills, { recursive: true });
-    for (const entry of await this.#skillEntries()) {
-      // A hand-placed skill has no source record and is never touched by a sync.
-      if (entry.source?.scope !== "account") continue;
-      const raw = allowed.get(entry.source.id);
-      if (!raw) {
-        await rm(entry.directory, { recursive: true, force: true });
-        removed += 1;
-        continue;
-      }
-      seen.add(entry.source.id);
-      await this.#writeSkill(
-        entry.directory,
-        {
-          id: entry.skill_id,
-          name: validName(raw.name, "skill"),
-          source: entry.source,
-          created_at: entry.created_at,
-          updated_at: Date.now(),
-        },
-        validContent(raw.content),
-      );
-      updated += 1;
+    const entries = await this.#skillEntries();
+
+    // What the agent already holds for each account skill. A copy imported earlier says
+    // so in its sidecar; one that arrived another way — restored from an export, or
+    // promoted to the account from here — says so in the file itself. Matching on both
+    // is what stops a sync growing a second copy beside the one already on disk. A
+    // hand-placed skill is nobody's copy and is never touched.
+    const held = new Map();
+    for (const entry of entries) {
+      if (entry.source?.scope === "manual") continue;
+      const key = entry.source?.scope === "account" ? entry.source.id : entry.identity;
+      if (key && !held.has(key)) held.set(key, entry);
     }
+
+    // A copy whose source is no longer shared with this agent goes, which is what makes
+    // revoking visibility take the skill off the disk.
+    for (const entry of entries) {
+      if (entry.source?.scope !== "account" || allowed.has(entry.source.id)) continue;
+      await rm(entry.directory, { recursive: true, force: true });
+      held.delete(entry.source.id);
+      removed += 1;
+    }
+
     for (const [sourceId, raw] of allowed) {
-      if (seen.has(sourceId)) continue;
+      const entry = held.get(sourceId);
       const name = validName(raw.name, "skill");
       const timestamp = Date.now();
       await this.#writeSkill(
-        await this.#skillDirectory(name),
+        entry ? entry.directory : await this.#skillDirectory(name),
         {
-          id: crypto.randomUUID(),
+          // The account row's id is the skill's id, here and in the file, so the two
+          // levels never need a mapping to agree on what is the same skill.
+          id: sourceId,
           name,
           source: { scope: "account", id: sourceId },
-          created_at: timestamp,
+          created_at: entry ? entry.created_at : timestamp,
           updated_at: timestamp,
         },
-        validContent(raw.content),
+        withSkillIdentity(validContent(raw.content), sourceId),
       );
-      created += 1;
+      if (entry) updated += 1;
+      else created += 1;
     }
     return { created, updated, removed };
   }
@@ -495,8 +551,14 @@ export async function discoverSkills(root) {
         const metadata = await readJson(resolve(child, ".zidane.json"), null);
         const relativePath = relative(root, child).split("\\").join("/");
         const managed = Boolean(metadata && SAFE_ID.test(String(metadata.id ?? "")));
+        // The file is the record: an id in the frontmatter outranks the sidecar, so a
+        // skill keeps its identity through a copy, an export, or a restore that leaves
+        // `.zidane.json` behind. A file that has never carried one falls back to the
+        // sidecar, and a hand-placed skill to a name derived from where it sits.
+        const identity = skillIdentity(content) || (managed ? String(metadata.id) : "");
         found.push({
-          skill_id: managed ? metadata.id : `manual-${createHash("sha256").update(relativePath).digest("hex").slice(0, 16)}`,
+          identity,
+          skill_id: identity || `manual-${createHash("sha256").update(relativePath).digest("hex").slice(0, 16)}`,
           name: validStoredName(metadata?.name) ?? inferredSkillName(content, entry.name),
           source: managed && metadata.source?.scope === "account" && SAFE_ID.test(String(metadata.source.id ?? ""))
             ? { scope: "account", id: String(metadata.source.id) }
