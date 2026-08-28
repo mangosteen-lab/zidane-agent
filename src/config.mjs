@@ -1,4 +1,5 @@
-import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { loadEnvFile, readEnvFile, writeEnvFile } from "./dotenv.mjs";
 
@@ -40,12 +41,57 @@ export function paths(config) {
   };
 }
 
+/** chmod needs ownership; these are the ways a filesystem says "not yours to change". */
+const NOT_OURS_TO_CHMOD = new Set(["EPERM", "EACCES", "EROFS", "ENOTSUP", "ENOSYS"]);
+
+/** Whether a directory is already no more permissive than what we would have set. */
+export function permissionsSufficient(current, wanted) {
+  return ((current & 0o777) & ~wanted) === 0;
+}
+
+/**
+ * Tighten a directory the agent owns, and say something usable when it cannot.
+ *
+ * The mode matters — `auth/` holds the session token and Pi's credentials — but chmod
+ * needs ownership, and a bind mount routinely arrives owned by someone else: a volume
+ * seeded by a root `cp -a`, a host directory, a platform-managed mount. That used to
+ * surface as a bare EPERM stack in a restart loop, which names neither the cause nor the
+ * repair. A directory already no wider than we would set it and readable/writable by this
+ * process needs nothing from us; anything else is an ownership problem the host has to
+ * fix, so say exactly that.
+ */
+async function harden(path, mode, root) {
+  try {
+    await chmod(path, mode);
+    return;
+  } catch (error) {
+    if (!NOT_OURS_TO_CHMOD.has(error?.code)) throw error;
+    let current = null;
+    let owner = "another user";
+    try {
+      const info = await stat(path);
+      current = info.mode & 0o777;
+      owner = `uid ${info.uid}:${info.gid}`;
+    } catch { /* not even readable: the message below still holds */ }
+    let usable = true;
+    try { await access(path, constants.R_OK | constants.W_OK | constants.X_OK); } catch { usable = false; }
+    if (usable && current !== null && permissionsSufficient(current, mode)) return;
+    const us = typeof process.getuid === "function" ? `${process.getuid()}:${process.getgid()}` : "";
+    const found = current === null ? "" : ` with mode 0${current.toString(8)}`;
+    throw new Error(
+      `cannot secure ${path}: it belongs to ${owner}${found} and this agent runs as `
+      + `${us ? `uid ${us}` : "another user"}. Hand the whole working directory over on the host — `
+      + `chown -R ${us || "<agent uid>:<agent gid>"} ${root} — and start the agent again.`,
+    );
+  }
+}
+
 export async function initialise(config) {
   const local = paths(config);
   await Promise.all(Object.values(local).filter((value) => !value.endsWith(".json") && !value.endsWith(".md") && !value.endsWith("session-token"))
     .map((value) => mkdir(value, { recursive: true })));
-  await chmod(local.root, 0o700);
-  await chmod(local.auth, 0o700);
+  await harden(local.root, 0o700, local.root);
+  await harden(local.auth, 0o700, local.root);
   await migrateSecretLayout(local);
   process.env.ZIDANE_AGENT_CONFIG_FILE = resolve(local.config, "applied.json");
   // Where a skill or tool should look for agent-owned state. Set before the applied

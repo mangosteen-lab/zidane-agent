@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { test } from "node:test";
-import { applyAgentInfo, applyState, initialise, readSecretValue, readSessionToken, resolveLlmProfile, writeSessionToken } from "../src/config.mjs";
+import { applyAgentInfo, applyState, initialise, permissionsSufficient, readSecretValue, readSessionToken, resolveLlmProfile, writeSessionToken } from "../src/config.mjs";
 import { AgentDataStore } from "../src/agent-data.mjs";
 
 test("LLM profiles and rotating sessions persist without embedding credentials", async () => {
@@ -102,6 +102,33 @@ test("LLM profiles and rotating sessions persist without embedding credentials",
   } finally {
     delete process.env.AGENT_TEST_SETTING;
     delete process.env.ZIDANE_TEST_RUNTIME_VALUE;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// Startup used to die on a bare EPERM when it could not chmod a directory it did not own,
+// which is what a bind mount seeded by a root `cp -a` looks like. A mode already no wider
+// than the one being asked for has nothing wrong with it and must not stop the agent.
+test("a directory is only a problem when it is more permissive than asked for", () => {
+  assert.equal(permissionsSufficient(0o700, 0o700), true);
+  assert.equal(permissionsSufficient(0o600, 0o700), true);
+  assert.equal(permissionsSufficient(0o500, 0o700), true);
+  assert.equal(permissionsSufficient(0o750, 0o700), false);
+  assert.equal(permissionsSufficient(0o755, 0o700), false);
+  assert.equal(permissionsSufficient(0o707, 0o700), false);
+  // Type bits ride along in stat's mode and are not permissions.
+  assert.equal(permissionsSufficient(0o40700, 0o700), true);
+});
+
+test("the working directory keeps its private mode across restarts", async () => {
+  const root = await mkdtemp(resolve(tmpdir(), "zidane-perm-test-"));
+  try {
+    const config = { name: "test", version: "1", description: "test", capacity: 1, workingDirectory: root };
+    const local = await initialise(config);
+    await initialise(config);
+    assert.equal((await stat(local.root)).mode & 0o777, 0o700);
+    assert.equal((await stat(local.auth)).mode & 0o777, 0o700);
+  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
