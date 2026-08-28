@@ -57,6 +57,7 @@ const logger = new AgentLogger(local, (level, message, fields) => {
 logger.log("info", "agent storage ready", {
   working_directory: local.root,
   config_maps: process.env.AI_AGENT_CONFIG_MAPS_FOLDER,
+  knowledge: process.env.AI_AGENT_KNOWLEDGE_FOLDER,
 });
 const memory = new MemoryStore(local);
 const journal = new DailyJournal(local, logger);

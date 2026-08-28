@@ -96,8 +96,10 @@ export async function initialise(config) {
   process.env.ZIDANE_AGENT_CONFIG_FILE = resolve(local.config, "applied.json");
   // Where a skill or tool should look for agent-owned state. Set before the applied
   // config is replayed below, and reserved from it, so a config map cannot redirect
-  // a skill to a directory of its own choosing.
+  // a skill to a directory of its own choosing. Both are process-wide: they are the
+  // same for every session, unlike AI_AGENT_SESSION_WORKSPACE_DIR.
   process.env.AI_AGENT_CONFIG_MAPS_FOLDER = local.configMaps;
+  process.env.AI_AGENT_KNOWLEDGE_FOLDER = local.knowledge;
   await loadEnvFile(local);
   try {
     const applied = JSON.parse(await readFile(process.env.ZIDANE_AGENT_CONFIG_FILE, "utf8"));

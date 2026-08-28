@@ -6,12 +6,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
     NODE_ENV=production \
     ZIDANE_AGENT_WORKING_DIRECTORY=/var/lib/zidane-agent
 
-# Where a skill looks for the agent's config maps. A separate ENV so the path derives
-# from the working directory above rather than repeating it: substitution within one ENV
-# instruction only sees values set before that instruction. The agent re-asserts it at
-# startup, so overriding ZIDANE_AGENT_WORKING_DIRECTORY at run time still resolves
-# correctly for the agent and everything it spawns; this is what `docker exec` sees.
-ENV AI_AGENT_CONFIG_MAPS_FOLDER=${ZIDANE_AGENT_WORKING_DIRECTORY}/config-maps
+# Where a skill looks for the agent's config maps and its synced knowledge. A separate ENV
+# so the paths derive from the working directory above rather than repeating it:
+# substitution within one ENV instruction only sees values set before that instruction. The
+# agent re-asserts both at startup, so overriding ZIDANE_AGENT_WORKING_DIRECTORY at run time
+# still resolves correctly for the agent and everything it spawns; this is what
+# `docker exec` sees.
+ENV AI_AGENT_CONFIG_MAPS_FOLDER=${ZIDANE_AGENT_WORKING_DIRECTORY}/config-maps \
+    AI_AGENT_KNOWLEDGE_FOLDER=${ZIDANE_AGENT_WORKING_DIRECTORY}/knowledge
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       bash ca-certificates curl fd-find git jq openssh-client python3 ripgrep tini \

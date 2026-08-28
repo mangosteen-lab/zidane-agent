@@ -11,7 +11,10 @@ test("a config map declares secret value names; the values come from the environ
   try {
     const config = { name: "test", version: "1", description: "test", capacity: 1, workingDirectory: root };
     const local = await initialise(config);
+    // The two process-wide folder variables, re-asserted from the actual working
+    // directory so the image's baked defaults cannot be wrong for this agent.
     assert.equal(process.env.AI_AGENT_CONFIG_MAPS_FOLDER, resolve(root, "config-maps"));
+    assert.equal(process.env.AI_AGENT_KNOWLEDGE_FOLDER, resolve(root, "knowledge"));
     // There is no separate secret store any more.
     assert.equal(local.secrets, undefined);
     await assert.rejects(stat(resolve(root, "secrets")), { code: "ENOENT" });
@@ -68,6 +71,13 @@ test("a config map declares secret value names; the values come from the environ
       store.handle("config.create", { name: "bad2", normal_values: {}, secret_entries: { AI_AGENT_CONFIG_MAPS_FOLDER: "/tmp" } }),
       /reserved secret value name/,
     );
+    // A normal value may carry a reserved name — it is simply never exported, so the
+    // folder variables keep pointing at this agent's own working directory.
+    await store.handle("config.create", {
+      name: "bad3", normal_values: { AI_AGENT_KNOWLEDGE_FOLDER: "/tmp", AI_AGENT_CONFIG_MAPS_FOLDER: "/tmp" }, secret_values: [],
+    });
+    assert.equal(process.env.AI_AGENT_KNOWLEDGE_FOLDER, resolve(root, "knowledge"));
+    assert.equal(process.env.AI_AGENT_CONFIG_MAPS_FOLDER, resolve(root, "config-maps"));
 
     // A desired-state push writes secret values the same way.
     await applyState(local, "revision-1", { LOG_LEVEL: "debug" }, { PUSHED_TOKEN: "pushed" });
