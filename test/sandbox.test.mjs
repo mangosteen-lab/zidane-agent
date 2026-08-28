@@ -20,6 +20,16 @@ test("a session's scratch is pinned to its workspace whatever a skill asks for",
     assert.equal(environment.PATH, "/usr/bin");
     assert.equal((await stat(paths.home)).isDirectory(), true);
 
+    // What a skill reads when it needs somewhere to clone into or build in: the session's
+    // own workspace, which is deleted with the conversation. It is per-session, so it
+    // overrides whatever the container was started with.
+    assert.equal(environment.AI_AGENT_SESSION_WORKSPACE_DIR, workspace);
+    assert.equal(withinWorkspace(workspace, environment.AI_AGENT_SESSION_WORKSPACE_DIR), true);
+    assert.equal(
+      sandboxEnvironment({ AI_AGENT_SESSION_WORKSPACE_DIR: "/somewhere/else" }, paths).AI_AGENT_SESSION_WORKSPACE_DIR,
+      workspace,
+    );
+
     assert.equal(withinWorkspace(workspace, "notes.md"), true);
     assert.equal(withinWorkspace(workspace, resolve(workspace, "deep", "notes.md")), true);
     assert.equal(withinWorkspace(workspace, workspace), true);

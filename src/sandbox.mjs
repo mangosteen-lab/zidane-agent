@@ -19,9 +19,10 @@ import { createBashToolDefinition, createEditToolDefinition, createWriteToolDefi
  * left alone: seeing the rest of the disk is not what causes the damage.
  */
 
-/** Where a session's `$HOME` and temporary directory live inside its workspace. */
+/** Where a session's workspace, `$HOME`, and temporary directory are. */
 export function sandboxPaths(workspace) {
-  return { home: resolve(workspace, ".home"), tmp: resolve(workspace, ".tmp") };
+  const root = resolve(workspace);
+  return { workspace: root, home: resolve(root, ".home"), tmp: resolve(root, ".tmp") };
 }
 
 export async function prepareSandbox(workspace) {
@@ -36,10 +37,18 @@ export async function prepareSandbox(workspace) {
  * `HOME` covers `~`, and the rest cover the several conventions a tool might reach for.
  * `ZIDANE_`/`AI_AGENT_` variables are already reserved from config maps, so nothing a
  * skill can set repoints these either.
+ *
+ * `AI_AGENT_SESSION_WORKSPACE_DIR` is the one a skill is meant to read: the directory
+ * this session owns, which is deleted with the conversation. A clone or a build tree is
+ * too big to want in `$TMPDIR` and too deliberate to want in `~`, and a skill that hard-
+ * codes `/tmp/<something>` shares it with every other session in the container. Unlike
+ * `AI_AGENT_CONFIG_MAPS_FOLDER`, which the image sets once, this one differs per session
+ * and exists only inside one.
  */
-export function sandboxEnvironment(environment, { home, tmp }) {
+export function sandboxEnvironment(environment, { workspace, home, tmp }) {
   return {
     ...environment,
+    AI_AGENT_SESSION_WORKSPACE_DIR: workspace,
     HOME: home,
     TMPDIR: tmp, TMP: tmp, TEMP: tmp,
     XDG_CACHE_HOME: resolve(home, ".cache"),
