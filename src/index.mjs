@@ -446,7 +446,7 @@ async function connect() {
       capabilities: {
         pi_sdk: true,
         parallel_sessions: config.capacity,
-        agent_storage: { version: 4, resources: ["skills", "config_maps", "secrets", "llm_profiles", "crontab"] },
+        agent_storage: { version: 5, resources: ["skills", "config_maps", "secrets", "llm_profiles", "crontab"] },
         providers: modelCatalog.map((provider) => provider.id),
         model_catalog: modelCatalog,
       },

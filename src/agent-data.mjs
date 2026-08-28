@@ -78,6 +78,7 @@ export class AgentDataStore {
     if (operation === "skill.create") return { item: await this.#createSkill(input) };
     if (operation === "skill.update") return { item: await this.#updateSkill(input) };
     if (operation === "skill.delete") return { deleted: await this.#deleteSkill(input.skill_id) };
+    if (operation === "skill.adopt") return { item: await this.#adoptSkill(input) };
     if (operation === "config.list") return { items: (await this.#loadConfigs()).map((item) => publicConfig(item)) };
     if (operation === "config.get") return { item: await this.#getConfig(input.config_id) };
     if (operation === "config.create") return { item: await this.#createConfig(input) };
@@ -174,6 +175,32 @@ export class AgentDataStore {
     const body = withSkillIdentity(content, id);
     await this.#writeSkill(entry.directory, metadata, body);
     return publicSkill({ ...metadata, content: body });
+  }
+
+  /**
+   * Bind a local skill to the account row it was just published to.
+   *
+   * The account row's id becomes this copy's id, in the sidecar and in the file, so the
+   * next sync updates this directory instead of importing a second copy of what is
+   * already here. A hand-placed skill becomes a managed one — publishing it is the
+   * explicit act that makes it the account's, and from then on a sync governs it.
+   */
+  async #adoptSkill(input) {
+    const entry = (await this.#skillEntries()).find((item) => item.skill_id === String(input.skill_id ?? ""));
+    if (!entry) throw new Error("skill not found");
+    const sourceId = validId(input.source_id, "account skill");
+    const clash = (await this.#skillEntries()).find((item) => item.skill_id === sourceId && item.directory !== entry.directory);
+    if (clash) throw new Error(`another skill here already has the id ${sourceId}`);
+    const content = withSkillIdentity(entry.content, sourceId);
+    const metadata = {
+      id: sourceId,
+      name: entry.name,
+      source: { scope: "account", id: sourceId },
+      created_at: entry.created_at,
+      updated_at: Date.now(),
+    };
+    await this.#writeSkill(entry.directory, metadata, content);
+    return publicSkill({ ...metadata, content });
   }
 
   async #deleteSkill(skillId) {

@@ -203,6 +203,30 @@ test("the same skill is recognisable between the agent and the account", async (
     assert.match(stored.content, /# Triage v3/);
     assert.equal(skillIdentity(stored.content), "shared-identity-1");
 
+    // Publishing a skill to the account binds this copy to the row it created, so the
+    // next sync updates this directory rather than importing a twin of it.
+    const runbook = (await store.handle("skill.create", {
+      name: "Runbook",
+      content: "---\nname: runbook\ndescription: A runbook\n---\n\n# Runbook\n",
+    })).item;
+    const bound = (await store.handle("skill.adopt", {
+      skill_id: runbook.skill_id,
+      source_id: "account-row-9",
+    })).item;
+    assert.equal(bound.skill_id, "account-row-9");
+    assert.deepEqual(bound.source, { scope: "account", id: "account-row-9" });
+    assert.equal(skillIdentity(bound.content), "account-row-9");
+    assert.match(bound.content, /# Runbook/);
+    const afterPublish = await store.handle("account.refresh", {
+      skills: [
+        { source_id: "shared-identity-1", name: "Triage", content: "# Triage v3\n" },
+        { source_id: "account-row-9", name: "Runbook", content: "# Runbook v2\n" },
+      ],
+      configs: [],
+    });
+    assert.deepEqual(afterPublish.skills, { created: 0, updated: 2, removed: 0 });
+    assert.equal((await store.handle("skill.list")).items.filter((item) => item.name === "Runbook").length, 1);
+
     // A hand-placed skill is still nobody's copy: a sync leaves it exactly where it is.
     const manual = resolve(local.skills, "hand-placed");
     await mkdir(manual, { recursive: true });
