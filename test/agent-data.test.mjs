@@ -3,7 +3,9 @@ import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { test } from "node:test";
+import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { AgentDataStore, skillIdentity, withSkillIdentity } from "../src/agent-data.mjs";
+import { contextTools } from "../src/context-tools.mjs";
 import { initialise } from "../src/config.mjs";
 
 test("agent-owned skills and config maps support local CRUD and account imports", async () => {
@@ -233,6 +235,50 @@ test("the same skill is recognisable between the agent and the account", async (
     await writeFile(resolve(manual, "SKILL.md"), "---\nname: hand-placed\ndescription: Mine\n---\n");
     await store.handle("account.refresh", { skills: [], configs: [] });
     assert.equal((await readFile(resolve(manual, "SKILL.md"), "utf8")).includes("id:"), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a session can save what it worked out as a skill a later one will load", async () => {
+  const root = await mkdtemp(resolve(tmpdir(), "zidane-draft-skill-test-"));
+  try {
+    const local = await initialise({ name: "t", version: "1", description: "", capacity: 1, workingDirectory: root });
+    const store = new AgentDataStore(local);
+    const draft = contextTools(local, null, store).find((tool) => tool.name === "draft_skill");
+    assert.ok(draft, "the tool is offered when the agent has a data store");
+    // Without a store there is nowhere to write, so the tool is not offered at all.
+    assert.equal(contextTools(local, null).some((tool) => tool.name === "draft_skill"), false);
+
+    const saved = await draft.execute("call-1", {
+      name: "Release train",
+      // A colon would end the key if this were written out unquoted, and Pi parses the
+      // block as real YAML: the skill would fail to load rather than load wrongly.
+      description: "Use when cutting a release: tags, notes, and the smoke check",
+      instructions: "# Release train\n\n1. Tag it.\n2. Write the notes.\n",
+    });
+    assert.equal(saved.details.replaced, false);
+
+    const stored = (await store.handle("skill.get", { skill_id: saved.details.skill_id })).item;
+    const { frontmatter, body } = parseFrontmatter(stored.content);
+    assert.equal(frontmatter.name, "release-train");
+    assert.equal(frontmatter.description, "Use when cutting a release: tags, notes, and the smoke check");
+    // The identity is stamped in by the store, and Pi reads straight past it.
+    assert.equal(frontmatter.id, saved.details.skill_id);
+    assert.match(body, /Tag it/);
+
+    // Saving the same name again refines that skill rather than growing a second one.
+    const again = await draft.execute("call-2", {
+      name: "release train",
+      description: "Use when cutting a release",
+      instructions: "# Release train\n\n1. Tag it.\n2. Write the notes.\n3. Smoke test.\n",
+    });
+    assert.equal(again.details.replaced, true);
+    assert.equal(again.details.skill_id, saved.details.skill_id);
+    const listed = (await store.handle("skill.list")).items;
+    assert.equal(listed.length, 1);
+    assert.equal(listed[0].source.scope, "agent");
+    assert.match((await store.handle("skill.get", { skill_id: listed[0].skill_id })).item.content, /Smoke test/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

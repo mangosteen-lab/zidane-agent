@@ -72,6 +72,8 @@ const cron = new CronScheduler(cronStore, runtime, logger, {
   intervalMs: (Number.parseInt(process.env.ZIDANE_AGENT_CRON_INTERVAL_SECONDS ?? "30", 10) || 30) * 1_000,
 });
 const agentData = new AgentDataStore(local, knowledge, cron);
+// A session saves a skill through the same store the REST relay uses.
+runtime.data = agentData;
 let modelCatalog = [];
 try {
   modelCatalog = await loadModelCatalog(local);

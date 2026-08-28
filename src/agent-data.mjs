@@ -28,7 +28,8 @@ export function skillIdentity(content) {
   if (!block) return "";
   for (const line of block[1].split(/\r?\n/)) {
     const separator = line.indexOf(":");
-    if (separator < 1 || line.slice(0, separator).trim() !== "id") continue;
+    // Top level only: an indented `id` belongs to whatever mapping it sits under.
+    if (separator < 1 || /^\s/.test(line) || line.slice(0, separator) !== "id") continue;
     const value = line.slice(separator + 1).trim().replace(/^["']|["']$/g, "");
     return SAFE_ID.test(value) ? value : "";
   }
@@ -45,7 +46,7 @@ export function withSkillIdentity(content, id) {
   const lines = block[1].split(/\r?\n/);
   const at = lines.findIndex((line) => {
     const separator = line.indexOf(":");
-    return separator > 0 && line.slice(0, separator).trim() === "id";
+    return separator > 0 && !/^\s/.test(line) && line.slice(0, separator) === "id";
   });
   if (at >= 0) lines[at] = `id: ${id}`;
   else lines.unshift(`id: ${id}`);

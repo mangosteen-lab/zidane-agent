@@ -3,8 +3,37 @@ import { resolve } from "node:path";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-export function contextTools(local, memory) {
+export function contextTools(local, memory, data) {
   return [
+    ...(data ? [defineTool({
+      name: "draft_skill",
+      label: "Draft skill",
+      description:
+        "Save what this session worked out as a reusable skill in this agent's own skill library, "
+        + "so a later session can follow it instead of working it out again. Use it for a task worth "
+        + "repeating: say when the skill applies, then the steps. Saving a name that already exists "
+        + "replaces that skill. Never put a credential in one.",
+      parameters: Type.Object({
+        name: Type.String({ minLength: 1, maxLength: 120 }),
+        description: Type.String({ minLength: 1, maxLength: 1_024 }),
+        instructions: Type.String({ minLength: 1, maxLength: 200_000 }),
+      }),
+      execute: async (_id, args) => {
+        const name = args.name.trim();
+        // The same serialised store the REST relay writes through, so a skill saved from
+        // a session cannot interleave with one being edited from the browser.
+        const existing = (await data.handle("skill.list")).items
+          .find((item) => String(item.name).toLowerCase() === name.toLowerCase());
+        const content = skillMarkdown(name, args.description, args.instructions);
+        const result = existing
+          ? await data.handle("skill.update", { skill_id: existing.skill_id, name, content })
+          : await data.handle("skill.create", { name, content });
+        return text(`${existing ? "Replaced" : "Saved"} the skill ${result.item.name}. It loads in new sessions.`, {
+          skill_id: result.item.skill_id,
+          replaced: Boolean(existing),
+        });
+      },
+    })] : []),
     defineTool({
       name: "remember",
       label: "Remember",
@@ -75,6 +104,24 @@ export function contextTools(local, memory) {
       },
     }),
   ];
+}
+
+/**
+ * A SKILL.md the loader will accept.
+ *
+ * Pi parses this block as real YAML and skips a skill whose description is missing, so
+ * the model supplies the two fields and the file is assembled here — a body written
+ * straight to disk would be a skill that silently never loads.
+ */
+function skillMarkdown(name, description, instructions) {
+  const slug = name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "skill";
+  return `---\nname: ${yamlScalar(slug)}\ndescription: ${yamlScalar(description)}\n---\n\n${instructions.trim()}\n`;
+}
+
+/** Plain where it can be read as plain, quoted where YAML would read it as structure. */
+function yamlScalar(value) {
+  const flat = String(value).replace(/\s+/g, " ").trim();
+  return /^[A-Za-z0-9][A-Za-z0-9 ._,'()/-]*$/.test(flat) ? flat : JSON.stringify(flat);
 }
 
 async function loadIndex(local) {

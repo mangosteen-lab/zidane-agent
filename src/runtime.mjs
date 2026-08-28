@@ -28,6 +28,9 @@ export class PiRuntime {
   constructor(config, local, emit, logger, memory, journal) {
     this.config = config; this.local = local; this.emit = emit;
     this.logger = logger; this.memory = memory; this.journal = journal;
+    // Set once the agent-data store exists. A session writes skills through that same
+    // store, so what it saves cannot interleave with an edit made from the browser.
+    this.data = null;
   }
   get active() { return this.#active.size; }
   /** In-flight runs, so a caller can wait for the runtime to settle. */
@@ -206,9 +209,9 @@ export class PiRuntime {
       thinkingLevel: profile.thinking_level ?? "medium",
       modelRuntime: runtime,
       resourceLoader: loader,
-      tools: profile.tools?.length ? profile.tools : ["read", "grep", "find", "ls", "write", "edit", "bash", "remember", "retrieve_memory", "forget_memory", "search_knowledge"],
+      tools: profile.tools?.length ? profile.tools : ["read", "grep", "find", "ls", "write", "edit", "bash", "remember", "retrieve_memory", "forget_memory", "search_knowledge", "draft_skill"],
       // The sandboxed bash/write/edit shadow Pi's built-ins of the same name.
-      customTools: [...sandboxTools(workspace, sandbox), ...contextTools(this.local, this.memory)],
+      customTools: [...sandboxTools(workspace, sandbox), ...contextTools(this.local, this.memory, this.data)],
     });
   }
 
