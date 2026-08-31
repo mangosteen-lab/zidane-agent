@@ -32,6 +32,8 @@ export class PiRuntime {
     // Set once the agent-data store exists. A session writes skills through that same
     // store, so what it saves cannot interleave with an edit made from the browser.
     this.data = null;
+    // Set once the follow-up store exists; a session asks to be woken through it.
+    this.followUps = null;
   }
   get active() { return this.#active.size; }
   /** In-flight runs, so a caller can wait for the runtime to settle. */
@@ -215,9 +217,14 @@ export class PiRuntime {
       thinkingLevel: profile.thinking_level ?? "medium",
       modelRuntime: runtime,
       resourceLoader: loader,
-      tools: profile.tools?.length ? profile.tools : ["read", "grep", "find", "ls", "write", "edit", "bash", "remember", "retrieve_memory", "forget_memory", "search_knowledge", "draft_skill"],
+      tools: profile.tools?.length ? profile.tools : ["read", "grep", "find", "ls", "write", "edit", "bash", "remember", "retrieve_memory", "forget_memory", "search_knowledge", "draft_skill", "check_back", "stop_checking"],
       // The sandboxed bash/write/edit shadow Pi's built-ins of the same name.
-      customTools: [...sandboxTools(workspace, sandbox), ...contextTools(this.local, this.memory, this.data)],
+      customTools: [
+        ...sandboxTools(workspace, sandbox),
+        // The conversation is passed in because `check_back` arms a wake for this one
+        // and nothing else: a session can only ask to be brought back to where it is.
+        ...contextTools(this.local, this.memory, this.data, { conversation, followUps: this.followUps }),
+      ],
     });
   }
 

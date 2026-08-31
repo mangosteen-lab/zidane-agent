@@ -40,6 +40,8 @@ export function paths(config) {
     // `$HOME` for every session: durable, shared, and deliberately beside the agent's
     // own state rather than around it. See `sandbox.mjs`.
     home: resolve(root, "home"),
+    // Conversations that asked to be woken later. See `follow-up.mjs`.
+    followUps: resolve(root, "follow-ups"),
     logs: resolve(root, "logs"), token: resolve(root, "auth", "session-token"),
   };
 }

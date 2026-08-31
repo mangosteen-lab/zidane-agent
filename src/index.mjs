@@ -16,6 +16,7 @@ import {
   writeSessionToken,
 } from "./config.mjs";
 import { CronScheduler, CronStore } from "./cron.mjs";
+import { FollowUpScheduler, FollowUpStore } from "./follow-up.mjs";
 import { DailyJournal } from "./daily.mjs";
 import { KnowledgeStore } from "./knowledge.mjs";
 import { AgentLogger } from "./logger.mjs";
@@ -74,9 +75,17 @@ const cron = new CronScheduler(cronStore, runtime, logger, {
   // becomes a direct message and a thread that resumes its session.
   emit: send,
 });
+// A conversation that asked to be woken later. Unlike cron this shares the ordinary
+// capacity: a wake speaks in a conversation, so it costs what a conversation costs, and
+// being refused while that conversation is busy just means trying again on the next tick.
+const followUps = new FollowUpStore(local);
+const followUpScheduler = new FollowUpScheduler(followUps, runtime, logger, {
+  intervalMs: (Number.parseInt(process.env.ZIDANE_AGENT_FOLLOW_UP_INTERVAL_SECONDS ?? "30", 10) || 30) * 1_000,
+});
 const agentData = new AgentDataStore(local, knowledge, cron);
 // A session saves a skill through the same store the REST relay uses.
 runtime.data = agentData;
+runtime.followUps = followUps;
 let modelCatalog = [];
 try {
   modelCatalog = await loadModelCatalog(local);
@@ -85,6 +94,7 @@ try {
 }
 await knowledge.start();
 if ((process.env.ZIDANE_AGENT_CRON ?? "true") !== "false") cron.start();
+if ((process.env.ZIDANE_AGENT_FOLLOW_UPS ?? "true") !== "false") followUpScheduler.start();
 
 // The day's work is summarised into memory once the day is over. Checked on a slow
 // timer rather than scheduled for an hour: an agent that was asleep at midnight, or

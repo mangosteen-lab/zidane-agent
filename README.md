@@ -35,6 +35,7 @@ config/          agent-owned config maps, effective config, LLM profiles, and cu
 secrets/         rotating/Pi credentials plus agent-owned write-only secrets (mode 0600)
                  synced/<name>/<key> holds one file per key of a synced secret
 sessions/        redacted Pi event transcripts
+follow-ups/      conversations that asked to be woken later
 home/            $HOME for every session: tool installs and tool configuration
 workspaces/      one isolated working directory per conversation
 exports/         portable tar.gz archives
@@ -117,6 +118,43 @@ no longer shared with this agent. Account skills import the same way and record 
 origin in the skill's `.zidane.json`, so a sync can refresh or remove exactly those
 copies; a `SKILL.md` placed in `skills/` by hand is never touched. Secret values are
 never returned by the agent.
+
+## Checking back on something slow
+
+A session that starts something long — a build, a deployment, an import, a test run —
+can ask to be woken:
+
+```text
+check_back(minutes: 30, note: "Release build 11.6.1000.0007 at https://ci.example.test/42.
+                               Done when the page shows SUCCESS or FAILURE; report which.")
+stop_checking()
+```
+
+When it comes due the agent prompts **that same conversation** again, so the wake lands in
+the same thread and the same Pi session: the model reads its own note, looks, and either
+reports the outcome or calls `check_back` again to look later. What the person sees is the
+agent coming back to them in the conversation they were already in. It works just as well
+when they ask for it — "watch that job and tell me how it goes" — because that is simply
+the model deciding to call the tool.
+
+One pending wake per conversation, re-armed by hand rather than repeating on its own: a
+schedule has no natural end and this always has one. Re-arming is also what lets the model
+back off from five minutes to fifteen when nothing is happening.
+
+The whole watch is bounded from when it *started* — 24 hours, or 120 wakes — so re-arming
+extends nothing, and the last wake says it is the last, so a watch that runs out of time
+ends with the agent saying where things stand rather than going quiet. A wake that arrives
+while that conversation is busy is put back and tried again on the next tick; it does not
+count as an attempt.
+
+The note is the whole instruction to the model's future self. Put the link and the success
+condition in it: the conversation may have been compacted by then, and the note may be all
+that is left of it.
+
+`ZIDANE_AGENT_FOLLOW_UPS=false` turns the timer off; `ZIDANE_AGENT_FOLLOW_UP_INTERVAL_SECONDS`
+(default 30) is how often it looks for something due. Pending wakes live in
+`follow-ups/pending.json` and survive a restart — an agent that was down comes back to one
+overdue wake per conversation, not one for every interval it missed.
 
 ## `$skill` commands
 
