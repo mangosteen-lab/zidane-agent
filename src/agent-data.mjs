@@ -108,6 +108,9 @@ export class AgentDataStore {
   async #listSkills() {
     return (await this.#skillEntries()).map(({ directory: _directory, managed: _managed, identity: _identity, content, ...item }) => ({
       ...item,
+      // The frontmatter line that says when to use it. The listing omits the body, but
+      // a console offering `$name` completion has nothing to show without this.
+      description: skillDescription(content),
       size_bytes: Buffer.byteLength(content),
     }));
   }
@@ -605,6 +608,13 @@ export async function discoverSkills(root) {
   }
   await walk(root, 0);
   return found.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+/** A skill's own one-line summary, from its frontmatter. */
+export function skillDescription(content) {
+  const frontmatter = /^---\s*\n([\s\S]*?)\n---/.exec(String(content ?? ""))?.[1] ?? "";
+  const declared = /^description:\s*["']?(.+?)["']?\s*$/m.exec(frontmatter)?.[1]?.trim();
+  return declared && declared.length <= 300 ? declared : "";
 }
 
 function inferredSkillName(content, fallback) {

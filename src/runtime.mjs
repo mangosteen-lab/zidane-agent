@@ -2,6 +2,7 @@ import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { discoverSkills } from "./agent-data.mjs";
+import { expandCommand, looksLikeCommand } from "./commands.mjs";
 import { readSecretValue, resolveLlmProfile } from "./config.mjs";
 import { contextTools } from "./context-tools.mjs";
 import { prepareSandbox, sandboxTools } from "./sandbox.mjs";
@@ -168,7 +169,7 @@ export class PiRuntime {
           if (tool) onProgress?.({ tool });
         }
       });
-      await session.prompt(prompt);
+      await session.prompt(await this.#expand(prompt, staged ?? this.local.skills));
       return text.trim().slice(0, 20_000);
     } finally {
       this.#running.delete(conversation);
@@ -220,6 +221,20 @@ export class PiRuntime {
     });
   }
 
+  /**
+   * Resolve a `$skill` command, if the prompt opens with one.
+   *
+   * The stored message keeps what the person typed; only what Pi is asked is rewritten,
+   * so a transcript still reads as the conversation it was.
+   */
+  async #expand(text, skillRoot = this.local.skills) {
+    if (!looksLikeCommand(text)) return text;
+    const resolved = await expandCommand(text, skillRoot);
+    if (resolved.skill) this.logger?.log("info", "skill command", { skill: resolved.skill });
+    else if (resolved.unknown) this.logger?.log("info", "no skill by that name", { name: resolved.unknown });
+    return resolved.text;
+  }
+
   async #run(delivery, entry) {
     this.logger?.log("info", "prompt started", { delivery_id: delivery.delivery_id, conversation_id: delivery.conversation_id });
     const conversation = safeName(delivery.conversation_id ?? delivery.delivery_id);
@@ -244,7 +259,7 @@ export class PiRuntime {
       }
     });
     try {
-      await session.prompt(delivery.text);
+      await session.prompt(await this.#expand(delivery.text));
       await writeFile(resolve(this.local.sessions, `${conversation}.json`), JSON.stringify(transcript));
       await this.journal?.record({
         conversation: delivery.conversation_id ?? conversation,

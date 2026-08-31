@@ -123,7 +123,9 @@ test("the scheduler bounds its own lane and queues the rest", async () => {
     assert.deepEqual(inFlight.map((item) => item.waiting), [false, false, true]);
 
     gates.get(tasks[0].id)();
-    await settle();
+    // Wait for the hand-over rather than for a fixed delay: freeing a slot and starting
+    // the next run is several promise turns, and a loaded machine takes longer than one.
+    await until(() => started.length === 3);
     // The freed slot goes to the task that has been waiting longest.
     assert.deepEqual(started.map((item) => item.id), [tasks[0].id, tasks[1].id, tasks[2].id]);
     assert.equal(scheduler.queued, 0);
@@ -233,6 +235,12 @@ test("a scheduled task is staged with only the skills it names", async () => {
 
 /** Let the scheduler's own await of `store.due()` resolve before inspecting it. */
 function settle() { return new Promise((done) => setTimeout(done, 10)); }
+
+/** Wait for something the lane does on its own, rather than for a fixed delay. */
+async function until(predicate, label = "condition") {
+  for (let attempt = 0; attempt < 200 && !predicate(); attempt += 1) await settle();
+  assert.ok(predicate(), `${label} never became true`);
+}
 
 /** Wait for the lane to empty. A run outlives the call that started it. */
 async function idle(scheduler) {

@@ -70,6 +70,24 @@ origin in the skill's `.zidane.json`, so a sync can refresh or remove exactly th
 copies; a `SKILL.md` placed in `skills/` by hand is never touched. Secret values are
 never returned by the agent.
 
+## `$skill` commands
+
+A prompt may open with `$name args…`, which means "do this with that skill":
+
+```text
+$pr-fill https://github.com/owner/repo/pull/13764
+```
+
+`commands.mjs` resolves the name against the skills this agent has installed and rewrites
+the prompt before Pi sees it — naming the skill, pointing at its `SKILL.md`, and passing
+the rest as input. Every other installed skill stays loadable, so a skill that depends on
+another one still works.
+
+Resolution belongs here because skills do: the control plane relays the text untouched
+and has no idea what is installed. A command is only the *first* token of a message, and
+a `$word` naming no installed skill is left exactly as typed — `$HOME` and `$5` are
+ordinary text, not typos to be guessed at.
+
 ## Run and test
 
 Node.js 22 or newer is required.
