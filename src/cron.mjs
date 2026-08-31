@@ -5,8 +5,16 @@ import { resolve } from "node:path";
  * Agent-private scheduled tasks.
  *
  * A crontab entry is a standing instruction the agent gives itself. It runs silently —
- * nothing is emitted to any chat — in a session of its own that is destroyed the moment
- * the run ends, so a schedule can never accumulate context or leak into a conversation.
+ * nothing reaches a chat while it works — in a session of its own, and each firing gets
+ * a fresh one, so a schedule never accumulates context across days.
+ *
+ * The newest run's session and workspace are then *kept*. Scheduled work is the work
+ * nobody watched, so when it finishes the agent hands the control plane a report: a
+ * direct message saying what happened, and a thread bound to the run's own conversation
+ * id. Replying there resumes that exact session, with its history and its files. The
+ * moment a task runs again, the copy it replaces is reclaimed — only the latest is kept,
+ * or a task firing every minute would fill the disk with workspaces.
+ *
  * The list and its history live on disk beside memory, which is what makes them travel
  * with an agent migration.
  */
@@ -151,11 +159,34 @@ export class CronStore {
         next_run_at: next,
         last_success: record.success ?? null,
         last_failure: record.failure ?? null,
+        // The conversation the newest run left behind: the thread that resumes it.
+        last_session_id: record.session ?? null,
       };
     });
   }
 
   get(taskId) { return this.#serial(async () => (await this.#decorated()).find((task) => task.id === String(taskId ?? "")) ?? null); }
+
+  /** The conversation the task's newest run left on disk, if it still has one. */
+  session(taskId) {
+    return this.#serial(async () => (await this.#readHistory())[String(taskId)]?.session ?? null);
+  }
+
+  /**
+   * Point the task at the session its newest run left behind, and answer with the one it
+   * replaces so the caller can reclaim it. Serialised with everything else that touches
+   * history: two runs of one task must never both believe they own the pointer.
+   */
+  setSession(taskId, conversation) {
+    return this.#serial(async () => {
+      const history = await this.#readHistory();
+      const id = String(taskId);
+      const previous = history[id]?.session ?? null;
+      history[id] = { ...(history[id] ?? {}), session: conversation ? String(conversation) : null };
+      await this.#writeHistory(history);
+      return previous;
+    });
+  }
 
   create(input) {
     return this.#serial(async () => {
@@ -323,14 +354,19 @@ export class CronScheduler {
   // faster than it runs must not stack up copies of itself.
   #queue = [];
   #timer = null;
+  // Reports the socket would not take. Held in memory only: a report is worth a
+  // reconnect, not a restart — the run itself is already in history either way.
+  #outbox = [];
 
   constructor(store, runtime, logger, options = {}) {
     this.store = store;
     this.runtime = runtime;
     this.logger = logger;
+    this.emit = options.emit ?? (() => false);
     this.limit = Math.max(1, Number(options.limit) || 3);
     this.queueLimit = Math.max(1, Number(options.queueLimit) || 100);
     this.intervalMs = Math.max(5_000, Number(options.intervalMs) || 30_000);
+    this.outboxLimit = Math.max(1, Number(options.outboxLimit) || 50);
   }
 
   get active() { return this.#running.size; }
@@ -463,11 +499,17 @@ export class CronScheduler {
     const started_at = Date.now();
     const live = { started_at, output: "", steps: [] };
     this.#progress.set(task.id, live);
-    this.logger?.log("info", "scheduled task started", { task_id: task.id, name: task.name });
+    // A conversation of its own per firing: the run starts clean, and the one it
+    // replaces stays readable until this one has something to replace it with.
+    const conversation = `cron-${task.id}-${crypto.randomUUID().slice(0, 8)}`;
+    const prompt = taskPrompt(task);
+    this.logger?.log("info", "scheduled task started", { task_id: task.id, name: task.name, conversation_id: conversation });
+    let entry = null;
     try {
       const output = await this.runtime.runTask({
         id: task.id,
-        prompt: taskPrompt(task),
+        conversation,
+        prompt,
         skills: task.skills ?? [],
         onProgress: (update) => {
           if (typeof update.text === "string") live.output = update.text.slice(-MAX_PROGRESS_BYTES);
@@ -477,15 +519,101 @@ export class CronScheduler {
           }
         },
       });
-      const entry = await this.store.record(task.id, { started_at, finished_at: Date.now(), status: "success", output });
+      entry = await this.store.record(task.id, { started_at, finished_at: Date.now(), status: "success", output });
       this.logger?.log("info", "scheduled task finished", { task_id: task.id, name: task.name, duration_ms: entry.duration_ms });
-      return entry;
     } catch (error) {
-      const entry = await this.store.record(task.id, { started_at, finished_at: Date.now(), status: "error", error: String(error) });
+      entry = await this.store.record(task.id, { started_at, finished_at: Date.now(), status: "error", error: String(error) });
       this.logger?.log("error", "scheduled task failed", { task_id: task.id, name: task.name, error: String(error) });
-      return entry;
     } finally {
       this.#progress.delete(task.id);
     }
+    await this.#handOver(task, conversation, prompt, entry);
+    return entry;
   }
+
+  /**
+   * Give the finished run to the control plane, and reclaim the one it replaces.
+   *
+   * In that order: the newest session is announced before the previous one is dropped,
+   * so a crash in between leaves a thread whose session is intact rather than a session
+   * nobody can reach.
+   */
+  async #handOver(task, conversation, prompt, entry) {
+    const previous = await this.store.setSession(task.id, conversation);
+    this.#send({
+      task_id: task.id,
+      name: task.name,
+      conversation_id: conversation,
+      status: entry?.status === "success" ? "success" : "error",
+      started_at: entry?.started_at ?? null,
+      finished_at: entry?.finished_at ?? null,
+      duration_ms: entry?.duration_ms ?? null,
+      prompt,
+      output: entry?.output ?? "",
+      error: entry?.error ?? "",
+    });
+    if (!previous || previous === conversation) return;
+    await this.#reclaim(previous, `This scheduled run of “${task.name}” was superseded by a newer one, and its session was reclaimed. Only the latest run of a task keeps a live session.`);
+  }
+
+  /**
+   * Delete a task and reclaim the session its last run left behind.
+   *
+   * A workspace now outlives the run that made it, so removing the schedule has to
+   * remove it too — a deleted task would otherwise leave its files on the agent forever.
+   * The thread the control plane holds is left alone: the transcript is the person's,
+   * not the schedule's.
+   */
+  async forget(taskId) {
+    const conversation = await this.store.session(taskId);
+    const deleted = await this.store.delete(taskId);
+    if (deleted && conversation) {
+      await this.#reclaim(conversation, "The scheduled task this run belonged to was deleted, and its session was reclaimed.");
+    }
+    return deleted;
+  }
+
+  /**
+   * Drop a run's session and tell its thread.
+   *
+   * `THREAD_COMPACTED` is the same signal a sweep sends and it means the same thing —
+   * the session is gone, work from the transcript — so the control plane already knows
+   * how to revive the thread from its own messages.
+   */
+  async #reclaim(conversation, summary) {
+    try {
+      await this.runtime.discard?.(conversation);
+      this.emit("THREAD_COMPACTED", { conversation_id: conversation, memory_id: "", summary });
+    } catch (error) {
+      // A run someone is replying to right now keeps its workspace; the control plane's
+      // own thread sweep reclaims it when the agent holds too many.
+      this.logger?.log("warning", "a finished scheduled run could not be reclaimed", {
+        conversation_id: conversation, error: String(error),
+      });
+    }
+  }
+
+  /** Queue a report and try to deliver it, oldest first. */
+  #send(report) {
+    this.#outbox.push(report);
+    while (this.#outbox.length > this.outboxLimit) this.#outbox.shift();
+    this.flush();
+  }
+
+  /**
+   * Deliver whatever the socket would not take earlier.
+   *
+   * Called again on every registration: a task that finished during a reconnect still
+   * reaches the person it was run for, in the order the runs happened.
+   */
+  flush() {
+    while (this.#outbox.length) {
+      if (this.emit("TASK_REPORT", this.#outbox[0]) === false) return false;
+      this.#outbox.shift();
+    }
+    return true;
+  }
+
+  /** Reports still waiting for a socket. */
+  get pending() { return this.#outbox.length; }
 }

@@ -70,6 +70,9 @@ const cronStore = new CronStore(local);
 const cron = new CronScheduler(cronStore, runtime, logger, {
   limit: Number.parseInt(process.env.ZIDANE_AGENT_CRON_CONCURRENCY ?? "3", 10) || 3,
   intervalMs: (Number.parseInt(process.env.ZIDANE_AGENT_CRON_INTERVAL_SECONDS ?? "30", 10) || 30) * 1_000,
+  // A finished run reports itself: nothing is emitted while it works, but what it did
+  // becomes a direct message and a thread that resumes its session.
+  emit: send,
 });
 const agentData = new AgentDataStore(local, knowledge, cron);
 // A session saves a skill through the same store the REST relay uses.
@@ -180,6 +183,11 @@ async function handleMessage(message) {
       await writeSessionToken(local, message.session_token);
     }
     logger.log("info", "agent registered", { agent_id: agentId });
+    // A task that finished while the socket was down still reports itself, in order.
+    if (cron.pending) {
+      logger.log("info", "delivering scheduled-task reports held over the reconnect", { pending: cron.pending });
+      cron.flush();
+    }
     return;
   }
   if (message.type === "ERROR") {

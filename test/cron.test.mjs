@@ -279,3 +279,98 @@ test("a running task can be tailed while it works", async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("a finished run is handed over as a resumable thread, and the one it replaces is reclaimed", async () => {
+  const root = await mkdtemp(resolve(tmpdir(), "zidane-cron-report-test-"));
+  try {
+    const store = new CronStore({ crontab: resolve(root, "crontab") });
+    const conversations = [];
+    const discarded = [];
+    const frames = [];
+    const runtime = {
+      runTask({ conversation }) { conversations.push(conversation); return Promise.resolve("swept 3 advisories"); },
+      discard(conversation) { discarded.push(conversation); return Promise.resolve(); },
+    };
+    const scheduler = new CronScheduler(store, runtime, null, {
+      limit: 1, emit: (type, fields) => { frames.push([type, fields]); return true; },
+    });
+    const task = await store.create({ name: "Nightly sweep", description: "check advisories", schedule: "0 2 * * *", skills: [] });
+
+    await scheduler.tick(Date.parse("2026-08-27T02:00:00Z"));
+    await idle(scheduler);
+
+    // The run keeps a conversation of its own, and the report names it: that id is the
+    // thread the control plane opens, and the session a reply resumes.
+    assert.equal(conversations.length, 1);
+    assert.match(conversations[0], new RegExp(`^cron-${task.id}-[0-9a-f]{8}$`));
+    const [[type, report]] = frames;
+    assert.equal(type, "TASK_REPORT");
+    assert.equal(report.conversation_id, conversations[0]);
+    assert.equal(report.task_id, task.id);
+    assert.equal(report.name, "Nightly sweep");
+    assert.equal(report.status, "success");
+    assert.equal(report.output, "swept 3 advisories");
+    assert.match(report.prompt, /check advisories/);
+    assert.ok(report.duration_ms >= 0);
+    // Nothing is reclaimed yet: the first run has nothing to replace.
+    assert.deepEqual(discarded, []);
+    assert.equal((await store.get(task.id)).last_session_id, conversations[0]);
+
+    // The next firing supersedes it: the newest session is announced first, then the
+    // previous one is dropped and its thread told to work from the transcript.
+    frames.length = 0;
+    await scheduler.tick(Date.parse("2026-08-28T02:00:00Z"));
+    await idle(scheduler);
+    assert.equal(conversations.length, 2);
+    assert.notEqual(conversations[1], conversations[0]);
+    assert.deepEqual(discarded, [conversations[0]]);
+    assert.deepEqual(frames.map(([kind]) => kind), ["TASK_REPORT", "THREAD_COMPACTED"]);
+    assert.equal(frames[0][1].conversation_id, conversations[1]);
+    assert.equal(frames[1][1].conversation_id, conversations[0]);
+    assert.match(frames[1][1].summary, /superseded/);
+    assert.equal((await store.get(task.id)).last_session_id, conversations[1]);
+
+    // Deleting the task takes its workspace with it: a schedule that is gone must not
+    // leave files behind, and its thread is told the session went with it.
+    frames.length = 0;
+    assert.equal(await scheduler.forget(task.id), true);
+    assert.deepEqual(discarded, [conversations[0], conversations[1]]);
+    assert.deepEqual(frames.map(([kind, fields]) => [kind, fields.conversation_id]), [["THREAD_COMPACTED", conversations[1]]]);
+    assert.equal(await scheduler.forget(task.id), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a failed run reports itself too, and a report the socket refuses waits for the next one", async () => {
+  const root = await mkdtemp(resolve(tmpdir(), "zidane-cron-outbox-test-"));
+  try {
+    const store = new CronStore({ crontab: resolve(root, "crontab") });
+    const frames = [];
+    let connected = false;
+    const runtime = { runTask: () => Promise.reject(new Error("the registry timed out")) };
+    const scheduler = new CronScheduler(store, runtime, null, {
+      limit: 1,
+      emit: (type, fields) => { if (!connected) return false; frames.push([type, fields]); return true; },
+    });
+    const task = await store.create({ name: "CVE sweep", schedule: "0 2 * * *", skills: [] });
+
+    await scheduler.tick(Date.parse("2026-08-27T02:00:00Z"));
+    await idle(scheduler);
+    // Refused by a closed socket: the run is in history, and the report waits.
+    assert.deepEqual(frames, []);
+    assert.equal(scheduler.pending, 1);
+    assert.match((await store.get(task.id)).last_failure.error, /the registry timed out/);
+
+    connected = true;
+    assert.equal(scheduler.flush(), true);
+    assert.equal(scheduler.pending, 0);
+    const [[type, report]] = frames;
+    assert.equal(type, "TASK_REPORT");
+    assert.equal(report.status, "error");
+    assert.match(report.error, /the registry timed out/);
+    assert.equal(report.output, "");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

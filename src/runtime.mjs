@@ -135,12 +135,17 @@ export class PiRuntime {
    *
    * Deliberately outside `config.capacity`: a nightly task must not be refused because
    * someone is chatting, and it is `CronScheduler` that bounds how many may run at once.
-   * Nothing is emitted — no `PROMPT_EVENT`, no `PROMPT_DONE` — so the run stays invisible
-   * to every chat surface; the log and the task's history are the only trace. The session
-   * and its workspace are destroyed when the run ends, whether it succeeded or not.
+   * Nothing is emitted while it works — no `PROMPT_EVENT`, no `PROMPT_DONE` — so the run
+   * reaches no chat surface as it happens.
+   *
+   * The session and its workspace **survive the run**. A scheduled run is the one kind of
+   * work nobody watched, so it is the one most worth picking up afterwards: the
+   * conversation id is handed to the control plane as a thread, and a reply there lands
+   * in this very session with its history and its files intact. Reclaiming the previous
+   * run's copy is the scheduler's job — only the newest is kept.
    */
-  async runTask({ id, prompt, skills = [], onProgress }) {
-    const conversation = safeName(`cron-${id}`);
+  async runTask({ id, conversation: conversationId, prompt, skills = [], onProgress }) {
+    const conversation = safeName(conversationId ?? `cron-${id}`);
     if (this.#running.has(conversation)) throw new BusyError("conversation");
     this.#running.add(conversation);
     const workspace = resolve(this.local.workspaces, conversation);
@@ -167,8 +172,8 @@ export class PiRuntime {
       return text.trim().slice(0, 20_000);
     } finally {
       this.#running.delete(conversation);
+      // The staged skills are a copy made for this run; the workspace and session stay.
       if (staged) await rm(staged, { recursive: true, force: true });
-      await this.#discard(conversation);
     }
   }
 
