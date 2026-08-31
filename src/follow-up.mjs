@@ -214,8 +214,10 @@ export function wakePrompt(record, { final = false } = {}) {
       ? "This is the last check — the watch has reached its limit. Report where things stand now, "
         + "say plainly that you have stopped watching, and do not call check_back again."
       : "Look at it now. If it has finished, or failed, say so here with the outcome — that message is "
-        + "what the person waiting will read. If it is still going, call check_back again with how long "
-        + "to wait; if you do not, nothing will bring you back. Keep it short while there is nothing to report.",
+        + "what the person waiting will read. If it is still going, call check_back again to keep "
+        + `looking; if you do not, nothing will bring you back. You have been checking every ${waited}, `
+        + "so use that again unless there is a reason to change it — and if the person asked for an "
+        + "interval, it is theirs, not yours. Keep it short while there is nothing to report.",
   ].join("\n");
 }
 

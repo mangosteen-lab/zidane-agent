@@ -22,7 +22,12 @@ export function contextTools(local, memory, data, session = {}) {
         + "command in it, and say how to tell finished from failed — by then this conversation may "
         + "have been summarised and the note may be all you have. "
         + "When it wakes you, either report the outcome or call this again to look later; calling it "
-        + "again replaces the pending check rather than adding a second one.",
+        + "again replaces the pending check rather than adding a second one. "
+        + "Choose the interval from how long the thing takes: a few minutes for something that should "
+        + "be done within the hour, fifteen to thirty for a long build or deployment, an hour for "
+        + "something that runs overnight. Checking every minute for something that takes hours only "
+        + "spends the watch — it stops after 120 checks or 24 hours, whichever comes first. If the "
+        + "person named an interval, use theirs.",
       parameters: Type.Object({
         minutes: Type.Integer({ minimum: MIN_MINUTES, maximum: MAX_MINUTES }),
         note: Type.String({ minLength: 1, maxLength: 2_000 }),

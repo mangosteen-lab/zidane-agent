@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { test } from "node:test";
-import { expandCommand, looksLikeCommand, matchSkill, parseCommand } from "../src/commands.mjs";
+import { DEFAULT_WATCH_MINUTES, expandCommand, looksLikeCommand, matchSkill, parseCommand } from "../src/commands.mjs";
 
 /** A skills directory holding one skill per name. */
 async function skillRoot(names) {
@@ -64,5 +64,43 @@ test("a command naming no installed skill is left as ordinary text", async () =>
     assert.equal(resolved.text, "$HOME is where the config lives");
     assert.equal(resolved.skill, null);
     assert.equal(resolved.unknown, "HOME");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("$watch carries the person's own interval, and needs no skill installed", async () => {
+  const root = await skillRoot([]);
+  try {
+    const asked = await expandCommand("$watch 15 the release build at https://ci.example.test/42", root);
+    assert.equal(asked.skill, "$watch");
+    assert.match(asked.text, /every 15 minutes/);
+    assert.match(asked.text, /This is what they asked for/);
+    assert.match(asked.text, /check_back with minutes: 15/);
+    assert.match(asked.text, /the release build at https:\/\/ci\.example\.test\/42/);
+
+    // No number: the agent still watches, on the default rather than a guess.
+    const bare = await expandCommand("$watch the deploy", root);
+    assert.match(bare.text, new RegExp(`every ${DEFAULT_WATCH_MINUTES} minutes`));
+    assert.match(bare.text, /What to watch: the deploy/);
+
+    // Nothing at all: it watches what the conversation was already about.
+    assert.match((await expandCommand("$watch", root)).text, /whatever this conversation was just about/);
+
+    // Out of range is clamped rather than refused: the intent is plain either way.
+    assert.match((await expandCommand("$watch 0 x", root)).text, /every 1 minutes/);
+    assert.match((await expandCommand("$watch 9999 x", root)).text, /every 1440 minutes/);
+
+    const stopped = await expandCommand("$unwatch", root);
+    assert.equal(stopped.skill, "$unwatch");
+    assert.match(stopped.text, /stop_checking/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("a built-in name means the same thing whatever skills an agent has", async () => {
+  const root = await skillRoot(["watch"]);
+  try {
+    // A skill called `watch` does not quietly redefine `$watch` on one agent.
+    const resolved = await expandCommand("$watch 5 something", root);
+    assert.equal(resolved.skill, "$watch");
+    assert.match(resolved.text, /check_back with minutes: 5/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });

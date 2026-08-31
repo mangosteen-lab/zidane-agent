@@ -141,6 +141,21 @@ One pending wake per conversation, re-armed by hand rather than repeating on its
 schedule has no natural end and this always has one. Re-arming is also what lets the model
 back off from five minutes to fifteen when nothing is happening.
 
+**How often it looks** is the model's choice — a few minutes for something due within the
+hour, fifteen to thirty for a long build — and each wake tells it what interval it has been
+using, so it keeps to it. To decide yourself, say so ("check every 20 minutes"), or use the
+command, which is not a suggestion:
+
+```text
+$watch 15 the release build at https://ci.example.test/42
+$watch the deploy            # every 10 minutes, the default
+$unwatch                     # stop
+```
+
+`$watch` and `$unwatch` are built in rather than being skills — they drive the agent's own
+machinery — so they mean the same thing on every agent, and a skill that happens to be
+called `watch` cannot redefine them.
+
 The whole watch is bounded from when it *started* — 24 hours, or 120 wakes — so re-arming
 extends nothing, and the last wake says it is the last, so a watch that runs out of time
 ends with the agent saying where things stand rather than going quiet. A wake that arrives
@@ -164,7 +179,10 @@ A prompt may open with `$name args…`, which means "do this with that skill":
 $pr-fill https://github.com/owner/repo/pull/13764
 ```
 
-`commands.mjs` resolves the name against the skills this agent has installed and rewrites
+Two commands are built in — `$watch` and `$unwatch`, which start and stop a check-back —
+and are resolved before the skills, so they mean the same thing everywhere.
+
+For everything else, `commands.mjs` resolves the name against the skills this agent has installed and rewrites
 the prompt before Pi sees it — naming the skill, pointing at its `SKILL.md`, and passing
 the rest as input. Every other installed skill stays loadable, so a skill that depends on
 another one still works.
