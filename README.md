@@ -166,6 +166,11 @@ The note is the whole instruction to the model's future self. Put the link and t
 condition in it: the conversation may have been compacted by then, and the note may be all
 that is left of it.
 
+A pending check-back is visible: the console reads it over the same relay as the crontab
+and shows it in the conversation's header, with a way to call it off. It also keeps the
+conversation from being compacted while it waits — a wake handed a summary of the work
+instead of the work is a wake that has lost what it was watching.
+
 `ZIDANE_AGENT_FOLLOW_UPS=false` turns the timer off; `ZIDANE_AGENT_FOLLOW_UP_INTERVAL_SECONDS`
 (default 30) is how often it looks for something due. Pending wakes live in
 `follow-ups/pending.json` and survive a restart — an agent that was down comes back to one

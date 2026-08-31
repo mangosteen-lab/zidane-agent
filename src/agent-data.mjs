@@ -57,12 +57,15 @@ export function withSkillIdentity(content, id) {
 export class AgentDataStore {
   #pending = Promise.resolve();
 
-  constructor(local, knowledge, cron) {
+  constructor(local, knowledge, cron, followUps = null) {
     this.local = local;
     this.knowledge = knowledge;
     // Present only where a scheduler is running; the REST relay reports the operation as
     // unsupported rather than pretending a task was stored on an agent that cannot run it.
     this.cron = cron;
+    // Pending check-backs, so a console can show that a conversation is being watched
+    // and stop it. The agent decides them; this only reads and cancels.
+    this.followUps = followUps;
     this.profileDirectory = resolve(local.config, "llm-profiles");
     this.defaultProfileFile = resolve(local.config, "default-llm-profile.json");
   }
@@ -96,6 +99,10 @@ export class AgentDataStore {
     if (operation === "cron.delete") return { deleted: await this.#cron().forget(input.task_id) };
     if (operation === "cron.run") return this.#cron().runNow(input.task_id);
     if (operation === "cron.progress") return this.#cron().progress(input.task_id);
+    if (operation === "follow-up.list") return { items: await this.#followUps().list() };
+    if (operation === "follow-up.cancel") {
+      return { cancelled: await this.#followUps().cancel(String(input.conversation_id ?? "")) };
+    }
     if (operation === "account.refresh") return this.#refreshAccountResources(input);
     throw new Error(`unsupported agent data operation: ${operation}`);
   }
@@ -103,6 +110,11 @@ export class AgentDataStore {
   #cron() {
     if (!this.cron) throw new Error("scheduled tasks are not available on this agent");
     return this.cron;
+  }
+
+  #followUps() {
+    if (!this.followUps) throw new Error("this agent does not keep check-backs");
+    return this.followUps;
   }
 
   async #listSkills() {

@@ -82,7 +82,7 @@ const followUps = new FollowUpStore(local);
 const followUpScheduler = new FollowUpScheduler(followUps, runtime, logger, {
   intervalMs: (Number.parseInt(process.env.ZIDANE_AGENT_FOLLOW_UP_INTERVAL_SECONDS ?? "30", 10) || 30) * 1_000,
 });
-const agentData = new AgentDataStore(local, knowledge, cron);
+const agentData = new AgentDataStore(local, knowledge, cron, followUps);
 // A session saves a skill through the same store the REST relay uses.
 runtime.data = agentData;
 runtime.followUps = followUps;
@@ -230,6 +230,18 @@ async function handleMessage(message) {
   }
   if (message.type === "COMPACT_THREAD") {
     try {
+      // A conversation waiting on a check-back keeps its session. Compacting it would
+      // hand the wake a summary of the work instead of the work, and the control plane
+      // cannot know that: only the agent holds the pending wakes.
+      const pending = await followUps.list();
+      if (pending.some((item) => item.conversation_id === message.conversation_id)) {
+        send("THREAD_COMPACT_FAILED", {
+          conversation_id: message.conversation_id,
+          error: "this conversation is waiting on a check-back",
+        });
+        logger.log("info", "thread kept for a pending check-back", { conversation_id: message.conversation_id });
+        return;
+      }
       const result = await runtime.compact(message.conversation_id);
       send("THREAD_COMPACTED", { conversation_id: message.conversation_id, ...result });
       logger.log("info", "thread compacted", { conversation_id: message.conversation_id, memory_id: result.memory_id });
@@ -466,7 +478,7 @@ async function connect() {
       capabilities: {
         pi_sdk: true,
         parallel_sessions: config.capacity,
-        agent_storage: { version: 5, resources: ["skills", "config_maps", "secrets", "llm_profiles", "crontab"] },
+        agent_storage: { version: 6, resources: ["skills", "config_maps", "secrets", "llm_profiles", "crontab", "follow_ups"] },
         providers: modelCatalog.map((provider) => provider.id),
         model_catalog: modelCatalog,
       },

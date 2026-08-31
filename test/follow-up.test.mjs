@@ -6,7 +6,9 @@ import { test } from "node:test";
 import {
   FollowUpScheduler, FollowUpStore, MAX_ATTEMPTS, MAX_WATCH_MS, isFinalWake, wakePrompt,
 } from "../src/follow-up.mjs";
+import { AgentDataStore } from "../src/agent-data.mjs";
 import { BusyError } from "../src/runtime.mjs";
+import { initialise } from "../src/config.mjs";
 
 const MINUTE = 60_000;
 
@@ -137,5 +139,28 @@ test("a due wake prompts its own conversation, and a busy one waits rather than 
     // Fired once, and gone until something asks again.
     assert.deepEqual(await pending.list(), []);
     assert.deepEqual(await scheduler.tick(now + 8 * MINUTE), []);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("a pending check-back can be read and called off from the console", async () => {
+  const root = await mkdtemp(resolve(tmpdir(), "zidane-followup-relay-"));
+  try {
+    const local = await initialise({ name: "t", version: "1", description: "", capacity: 1, workingDirectory: root });
+    const pending = new FollowUpStore(local);
+    const data = new AgentDataStore(local, null, null, pending);
+    await pending.arm({ conversation: "thread-1", note: "build 42", minutes: 15 });
+
+    const listed = await data.handle("follow-up.list");
+    assert.deepEqual(listed.items.map((item) => item.conversation_id), ["thread-1"]);
+    assert.equal(listed.items[0].minutes, 15);
+
+    assert.deepEqual(await data.handle("follow-up.cancel", { conversation_id: "thread-1" }), { cancelled: true });
+    assert.deepEqual((await data.handle("follow-up.list")).items, []);
+    // Calling off one that is not there is not an error, just nothing to call off.
+    assert.deepEqual(await data.handle("follow-up.cancel", { conversation_id: "thread-1" }), { cancelled: false });
+
+    // An agent without the machinery says so rather than pretending it stored nothing.
+    const without = new AgentDataStore(local, null, null, null);
+    await assert.rejects(() => without.handle("follow-up.list"), /does not keep check-backs/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
