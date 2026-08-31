@@ -93,24 +93,26 @@ test("a schedule fires once in its minute, is never made up after downtime, and 
 
 test("the scheduler bounds its own lane and queues the rest", async () => {
   const root = await mkdtemp(resolve(tmpdir(), "zidane-cron-run-test-"));
+  const started = [];
+  // Declared out here because the cleanup needs them: a gated run left holding the
+  // directory is what turns a failed assertion into an unrelated ENOENT.
+  const gates = new Map();
+  const store = new CronStore({ crontab: resolve(root, "crontab") });
+  const runtime = {
+    runTask(input) {
+      started.push(input);
+      return new Promise((finish) => gates.set(input.id, () => finish("did the thing")));
+    },
+  };
+  const scheduler = new CronScheduler(store, runtime, null, { limit: 2 });
   try {
-    const store = new CronStore({ crontab: resolve(root, "crontab") });
-    const started = [];
-    const gates = new Map();
-    const runtime = {
-      runTask(input) {
-        started.push(input);
-        return new Promise((finish) => gates.set(input.id, () => finish("did the thing")));
-      },
-    };
-    const scheduler = new CronScheduler(store, runtime, null, { limit: 2 });
 
     const tasks = [];
     for (const name of ["one", "two", "three"]) {
       tasks.push(await store.create({ name, description: `${name} runs`, schedule: "0 2 * * *", skills: ["ops"] }));
     }
     const running = scheduler.tick(Date.parse("2026-08-27T02:00:00Z"));
-    await settle();
+    await until(() => started.length === 2, "two runs started");
     // Two of the three start; the third waits for a slot rather than losing its firing.
     assert.deepEqual(started.map((item) => item.id), [tasks[0].id, tasks[1].id]);
     assert.equal(scheduler.active, 2);
@@ -161,33 +163,40 @@ test("the scheduler bounds its own lane and queues the rest", async () => {
     await idle(scheduler);
     assert.match(taskPrompt({ name: "x", schedule: "* * * * *" }), /Schedule: \* \* \* \* \* \(UTC\)/);
   } finally {
+    // Let go of anything still gated, then wait for the lane: deleting the directory
+    // under an in-flight history write turns a failed assertion into an ENOENT that
+    // names neither the test nor the reason.
+    for (const release of gates.values()) release();
+    await idle(scheduler);
     await rm(root, { recursive: true, force: true });
   }
 });
 
 test("a queued task is honoured as it stands when its slot comes, and never stacks up", async () => {
   const root = await mkdtemp(resolve(tmpdir(), "zidane-cron-queue-test-"));
+  const started = [];
+  const gates = new Map();
+  const store = new CronStore({ crontab: resolve(root, "crontab") });
+  const runtime = {
+    runTask(input) {
+      started.push(input.id);
+      return new Promise((finish) => gates.set(input.id, () => finish("done")));
+    },
+  };
+  const scheduler = new CronScheduler(store, runtime, null, { limit: 1 });
   try {
-    const store = new CronStore({ crontab: resolve(root, "crontab") });
-    const started = [];
-    const gates = new Map();
-    const runtime = {
-      runTask(input) {
-        started.push(input.id);
-        return new Promise((finish) => gates.set(input.id, () => finish("done")));
-      },
-    };
-    const scheduler = new CronScheduler(store, runtime, null, { limit: 1 });
     const blocker = await store.create({ name: "blocker", schedule: "* * * * *", skills: [] });
     const waiter = await store.create({ name: "waiter", schedule: "* * * * *", skills: [] });
 
     const first = scheduler.tick(Date.parse("2026-08-27T02:00:00Z"));
-    await settle();
+    await until(() => started.length === 1, "the blocker started");
     assert.deepEqual(started, [blocker.id]);
     assert.equal(scheduler.queued, 1);
 
     // A firing that arrives while the same task is still pending is not stacked on top.
     void scheduler.tick(Date.parse("2026-08-27T02:01:00Z"));
+    // A fixed wait is right here and only here: the assertion is that nothing was added,
+    // so checking too early passes rather than flakes.
     await settle();
     assert.equal(scheduler.queued, 1);
 
@@ -204,11 +213,13 @@ test("a queued task is honoured as it stands when its slot comes, and never stac
     await store.update({ task_id: waiter.id, enabled: true });
     const third = await store.create({ name: "third", schedule: "* * * * *", skills: [] });
     void small.tick(Date.parse("2026-08-27T02:02:00Z"));
-    await settle();
+    await until(() => small.active === 1, "the lane filled");
     assert.equal(small.active, 1);
     assert.equal(small.queued, 1);
     assert.equal((await store.get(third.id)).last_success, null);
   } finally {
+    for (const release of gates.values()) release();
+    await idle(scheduler);
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -266,7 +277,7 @@ test("a running task can be tailed while it works", async () => {
     });
 
     const running = scheduler.tick(Date.parse("2026-08-27T02:00:00Z"));
-    await settle();
+    await until(() => Boolean(report), "the run reached the runtime");
     report.onProgress({ text: "working" });
     report.onProgress({ tool: "bash" });
     report.onProgress({ text: "working on it" });
