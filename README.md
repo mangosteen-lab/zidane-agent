@@ -41,6 +41,30 @@ exports/         portable tar.gz archives
 logs/            rotated, redacted JSON logs
 ```
 
+### What the image provides
+
+A session runs unprivileged, so `apt` is out of reach: the tools it can rely on are the
+ones in the image.
+
+```text
+git  git-lfs  gh  glab        version control, GitHub, GitLab
+curl  jq  ripgrep (rg)        fetching and reading
+fd-find (fdfind)  unzip  xz   finding and unpacking
+python3  python3-venv         a venv inside the workspace; there is no pip on the system
+node  npm                     Node 22
+openssh-client  ca-certificates  bash  tini
+```
+
+`gh` and `glab` read `GH_TOKEN`/`GITHUB_TOKEN` and `GITLAB_TOKEN` from the environment,
+which is where a config map's secret values already are — so no `auth login` is needed to
+use them. Git ships with a system identity (`Zidane Agent <zidane-agent@localhost>`) so
+`git commit` works out of the box, and with the LFS filters registered so an LFS
+repository checks out its content rather than pointer files. Give an agent its own
+identity from a session with `git config --global`: the shared home persists, and global
+beats system.
+
+Anything else a session installs belongs in `~/.local` — see below.
+
 ### What a session keeps, and what it throws away
 
 A session runs with two lifetimes, and a skill should use both deliberately:
