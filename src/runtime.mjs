@@ -189,10 +189,10 @@ export class PiRuntime {
   /** Everything a prompt needs before it can be sent: workspace, model, session. */
   async #session(conversation, workspace, profile, skillPaths = [this.local.skills]) {
     await mkdir(workspace, { recursive: true });
-    // $HOME and $TMPDIR point inside the workspace, so scratch files die with the
-    // conversation instead of piling up in the container or reaching the agent's own
-    // state. A skill that says to write to ~/ still lands here.
-    const sandbox = await prepareSandbox(workspace);
+    // $TMPDIR points inside the workspace, so scratch dies with the conversation instead
+    // of piling up in the container. $HOME is the agent's shared session home, which is
+    // what lets a tool installed or configured once still be there next time.
+    const sandbox = await prepareSandbox(workspace, this.local.home);
     const runtime = await ModelRuntime.create({ authPath: resolve(this.local.auth, "pi-auth.json"), modelsPath: resolve(this.local.config, "models.json") });
     if (profile.provider && profile.secret_value) {
       await runtime.setRuntimeApiKey(profile.provider, readSecretValue(profile.secret_value));

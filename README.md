@@ -35,10 +35,34 @@ config/          agent-owned config maps, effective config, LLM profiles, and cu
 secrets/         rotating/Pi credentials plus agent-owned write-only secrets (mode 0600)
                  synced/<name>/<key> holds one file per key of a synced secret
 sessions/        redacted Pi event transcripts
+home/            $HOME for every session: tool installs and tool configuration
 workspaces/      one isolated working directory per conversation
 exports/         portable tar.gz archives
 logs/            rotated, redacted JSON logs
 ```
+
+### What a session keeps, and what it throws away
+
+A session runs with two lifetimes, and a skill should use both deliberately:
+
+| | Environment variable | Lives until |
+| --- | --- | --- |
+| Clones, builds, scratch | `AI_AGENT_SESSION_WORKSPACE_DIR`, and `$TMPDIR` inside it | the conversation ends |
+| Tool installs and configuration | `$HOME` (and the `XDG_*` directories) | removed by hand |
+
+Sessions run unprivileged, so `apt` is out of reach and anything a session needs beyond
+the image has to be installed without root — but the workspace is deleted with the
+conversation, so installing there means reinstalling on every prompt. `$HOME` is therefore
+the agent's own durable `home/`, shared by every session: `gh auth login` writes
+`~/.config/gh` once, a `~/.gitconfig` survives, and `~/.local/bin` leads `PATH` so an
+unprivileged install (`npm i -g --prefix ~/.local`, a binary dropped in by hand) is on the
+path by name in the next conversation. The flip side is that it is shared: one session can
+shadow a system tool for every session after it.
+
+`home/` sits beside the agent's state rather than around it, so `auth/`, `config-maps/`,
+and `memory/` are siblings of `$HOME` and nothing a tool writes under `~` can reach them.
+It is not part of a portable export either, so tool state — and any token `gh auth login`
+left behind — stays on the machine it was created on.
 
 Memory rejects recognizable credentials, supports normal/private/restricted sensitivity,
 and is capped at 10,000 active records. Built-in Pi tools let the agent remember,

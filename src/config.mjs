@@ -37,6 +37,9 @@ export function paths(config) {
     sessions: resolve(root, "sessions"),
     auth: resolve(root, "auth"),
     workspaces: resolve(root, "workspaces"), exports: resolve(root, "exports"),
+    // `$HOME` for every session: durable, shared, and deliberately beside the agent's
+    // own state rather than around it. See `sandbox.mjs`.
+    home: resolve(root, "home"),
     logs: resolve(root, "logs"), token: resolve(root, "auth", "session-token"),
   };
 }
