@@ -229,7 +229,7 @@ export class PiRuntime {
   }
 
   /**
-   * Resolve a `$skill` command, if the prompt opens with one.
+   * Resolve a `$skill` or `\built-in` command, if the prompt opens with one.
    *
    * The stored message keeps what the person typed; only what Pi is asked is rewritten,
    * so a transcript still reads as the conversation it was.

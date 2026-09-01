@@ -1,5 +1,5 @@
 /**
- * `$skill` commands.
+ * `$skill` commands, and the `\built-in` ones.
  *
  * A message may open with `$name args…`, which means "do this with that skill". It is
  * the one piece of syntax the chat box has, and it exists because naming the skill is
@@ -15,21 +15,24 @@
  * them would be worse than not resolving a typo.
  *
  * A couple of commands are built in rather than being skills, because they drive the
- * agent's own machinery rather than describing work: `$watch` and `$unwatch` are how a
+ * agent's own machinery rather than describing work: `\watch` and `\unwatch` are how a
  * person starts and stops a follow-up by hand, with the interval they want rather than
- * the one the model would have chosen. They are checked before the skills, so the names
- * mean the same thing on every agent.
+ * the one the model would have chosen. They answer to a **backslash, not a dollar** —
+ * `$` means "a skill of mine", and the built-ins are not skills, so a person reading
+ * `$watch` would go looking for a skill that does not exist. The two sigils never
+ * overlap: `$watch` only ever means a skill called `watch`, and `\pr-fill` names no
+ * built-in and so stays ordinary text.
  */
 
 import { resolve } from "node:path";
 import { discoverSkills } from "./agent-data.mjs";
 import { MAX_MINUTES, MIN_MINUTES } from "./follow-up.mjs";
 
-/** What `$watch` uses when the person did not say how often. */
+/** What `\watch` uses when the person did not say how often. */
 export const DEFAULT_WATCH_MINUTES = 10;
 
-/** `$name`, then the rest of that line, then whatever follows on later lines. */
-const COMMAND = /^[ \t]*\$([A-Za-z][A-Za-z0-9._-]*)[ \t]*([^\n]*)(?:\n([\s\S]*))?$/;
+/** The sigil, `name`, the rest of that line, then whatever follows on later lines. */
+const COMMAND = /^[ \t]*([$\\])([A-Za-z][A-Za-z0-9._-]*)[ \t]*([^\n]*)(?:\n([\s\S]*))?$/;
 
 /** True when the text is worth resolving at all, so the common message never walks disk. */
 export function looksLikeCommand(text) {
@@ -40,9 +43,10 @@ export function parseCommand(text) {
   const match = COMMAND.exec(String(text ?? ""));
   if (!match) return null;
   return {
-    name: match[1],
-    argument: (match[2] ?? "").trim(),
-    body: (match[3] ?? "").trim(),
+    sigil: match[1],
+    name: match[2],
+    argument: (match[3] ?? "").trim(),
+    body: (match[4] ?? "").trim(),
   };
 }
 
@@ -86,12 +90,12 @@ export function commandPrompt(skill, { argument, body }) {
 export const BUILT_INS = {
   watch: {
     description: "Check back on something every few minutes until it is done, then report",
-    usage: "$watch [minutes] <what to watch>",
+    usage: "\\watch [minutes] <what to watch>",
     expand: ({ argument, body }) => {
-      // `$watch 15 the build at …`, or `$watch the build at …` for the default.
+      // `\watch 15 the build at …`, or `\watch the build at …` for the default.
       const [, spoken, rest] = /^(\d{1,4})?\s*([\s\S]*)$/.exec(argument) ?? [];
       // A number they typed is a number they meant, clamped into range. Only its absence
-      // is unspecified — `$watch 0` is not a request for the default.
+      // is unspecified — `\watch 0` is not a request for the default.
       const minutes = spoken === undefined
         ? DEFAULT_WATCH_MINUTES
         : Math.min(MAX_MINUTES, Math.max(MIN_MINUTES, Number(spoken)));
@@ -113,7 +117,7 @@ export const BUILT_INS = {
   },
   unwatch: {
     description: "Stop the check-back running on this conversation",
-    usage: "$unwatch",
+    usage: "\\unwatch",
     expand: () => [
       "The person has asked you to stop watching whatever this conversation was following.",
       "Call stop_checking, then confirm in one line that you have stopped and say where",
@@ -123,18 +127,26 @@ export const BUILT_INS = {
 };
 
 /**
- * Rewrite a prompt that opens with a `$skill` command.
+ * Rewrite a prompt that opens with a `$skill` or `\built-in` command.
  *
- * Returns what to send and which skill it named, so a caller can log it. Anything that
+ * Returns what to send and which command it named, so a caller can log it. Anything that
  * is not a command, or names a skill this agent does not have, comes back untouched.
+ *
+ * The sigil decides where to look, and only there. A backslash asks for the agent's own
+ * machinery and never falls through to a skill; a dollar asks for a skill and never
+ * reaches a built-in, so a skill called `watch` keeps `$watch` and cannot quietly
+ * redefine `\watch` on one agent.
  */
 export async function expandCommand(text, skillRoot) {
   const parsed = parseCommand(text);
   if (!parsed) return { text, skill: null, unknown: null };
-  // Built in first: these name the agent's own machinery, and a skill that happened to
-  // be called `watch` must not quietly change what `$watch` does on one agent.
-  const builtIn = BUILT_INS[parsed.name.toLowerCase()];
-  if (builtIn) return { text: builtIn.expand(parsed), skill: `$${parsed.name.toLowerCase()}`, unknown: null };
+  if (parsed.sigil === "\\") {
+    const builtIn = BUILT_INS[parsed.name.toLowerCase()];
+    // An unknown `\word` is left alone, the same leniency `$HOME` gets: a backslash in
+    // front of a word is ordinary enough in prose and in a code snippet.
+    if (!builtIn) return { text, skill: null, unknown: null };
+    return { text: builtIn.expand(parsed), skill: `\\${parsed.name.toLowerCase()}`, unknown: null };
+  }
   let skills = [];
   try { skills = await discoverSkills(skillRoot); }
   catch { return { text, skill: null, unknown: null }; }

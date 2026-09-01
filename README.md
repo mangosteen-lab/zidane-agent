@@ -147,14 +147,15 @@ using, so it keeps to it. To decide yourself, say so ("check every 20 minutes"),
 command, which is not a suggestion:
 
 ```text
-$watch 15 the release build at https://ci.example.test/42
-$watch the deploy            # every 10 minutes, the default
-$unwatch                     # stop
+\watch 15 the release build at https://ci.example.test/42
+\watch the deploy            # every 10 minutes, the default
+\unwatch                     # stop
 ```
 
-`$watch` and `$unwatch` are built in rather than being skills — they drive the agent's own
-machinery — so they mean the same thing on every agent, and a skill that happens to be
-called `watch` cannot redefine them.
+`\watch` and `\unwatch` are built in rather than being skills — they drive the agent's own
+machinery — so they take a **backslash rather than a dollar**: `$` means "a skill of
+mine", and these are not skills. The two sigils never reach into each other, so a skill
+that happens to be called `watch` keeps `$watch` and cannot redefine `\watch`.
 
 The whole watch is bounded from when it *started* — 24 hours, or 120 wakes — so re-arming
 extends nothing, and the last wake says it is the last, so a watch that runs out of time
@@ -176,7 +177,7 @@ instead of the work is a wake that has lost what it was watching.
 `follow-ups/pending.json` and survive a restart — an agent that was down comes back to one
 overdue wake per conversation, not one for every interval it missed.
 
-## `$skill` commands
+## `$skill` and `\built-in` commands
 
 A prompt may open with `$name args…`, which means "do this with that skill":
 
@@ -184,8 +185,9 @@ A prompt may open with `$name args…`, which means "do this with that skill":
 $pr-fill https://github.com/owner/repo/pull/13764
 ```
 
-Two commands are built in — `$watch` and `$unwatch`, which start and stop a check-back —
-and are resolved before the skills, so they mean the same thing everywhere.
+Two commands are built in — `\watch` and `\unwatch`, which start and stop a check-back.
+They answer to a backslash, so they are never confused for a skill and never shadowed by
+one; the sigil alone decides which list `commands.mjs` looks in.
 
 For everything else, `commands.mjs` resolves the name against the skills this agent has installed and rewrites
 the prompt before Pi sees it — naming the skill, pointing at its `SKILL.md`, and passing
@@ -195,7 +197,8 @@ another one still works.
 Resolution belongs here because skills do: the control plane relays the text untouched
 and has no idea what is installed. A command is only the *first* token of a message, and
 a `$word` naming no installed skill is left exactly as typed — `$HOME` and `$5` are
-ordinary text, not typos to be guessed at.
+ordinary text, not typos to be guessed at. A `\word` naming no built-in gets the same
+leniency.
 
 ## Run and test
 
