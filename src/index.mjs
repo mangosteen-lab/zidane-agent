@@ -86,6 +86,9 @@ const agentData = new AgentDataStore(local, knowledge, cron, followUps);
 // A session saves a skill through the same store the REST relay uses.
 runtime.data = agentData;
 runtime.followUps = followUps;
+// A session files its own knowledge articles through the same store the sync writes to,
+// in the root the sync never sweeps.
+runtime.knowledge = knowledge;
 let modelCatalog = [];
 try {
   modelCatalog = await loadModelCatalog(local);

@@ -11,6 +11,14 @@
  * The hierarchy lives in each article's `parent_id`, not in the directory layout —
  * the agent only ever searches, so nesting would buy it nothing. The repository
  * format that mirrors the tree is the control plane's concern.
+ *
+ * Beside it, `knowledge/notes/<id>/<Name>.md` is what **this agent wrote for itself** —
+ * `\summarize_knowledge` on a conversation, through the `draft_knowledge` tool. It is the
+ * same file format and the same index, so `search_knowledge` finds both without knowing
+ * the difference, but it is a separate root because `apply()` replaces the synced set
+ * wholesale: a note filed under `articles/` would be deleted by the next account sync.
+ * Nothing here travels up to the account — a note is this agent's own, and promoting one
+ * is still a deliberate act made from the console.
  */
 
 import { chmod, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
@@ -27,10 +35,12 @@ export class KnowledgeStore {
     this.local = local;
     this.logger = logger;
     this.articles = resolve(local.knowledge, "articles");
+    this.notes = resolve(local.knowledge, "notes");
   }
 
   async start() {
     await mkdir(this.articles, { recursive: true });
+    await mkdir(this.notes, { recursive: true });
     await this.#rebuildIndex();
   }
 
@@ -47,14 +57,42 @@ export class KnowledgeStore {
         await rm(resolve(this.articles, entry.name), { recursive: true, force: true });
       }
     }
-    for (const article of wanted.values()) await this.#write(article);
+    for (const article of wanted.values()) await this.#write(article, this.articles);
     await this.#rebuildIndex();
     return { count: wanted.size };
   }
 
-  async #write(article) {
-    const directory = resolve(this.articles, article.id);
-    if (dirname(directory) !== this.articles) throw new Error("article path escapes the store");
+  /**
+   * File one article this agent wrote itself, and index it now.
+   *
+   * The id is derived from the title, so writing the same title again replaces that note
+   * rather than leaving two versions of one thing to be found — the same rule
+   * `draft_skill` follows. It cannot collide with a synced article: those are account
+   * ids, and this one is prefixed.
+   */
+  async note(input) {
+    const name = String(input?.name ?? "").trim();
+    if (!name) throw new Error("a knowledge note needs a title");
+    const article = validArticle({ ...input, name, id: noteId(name) });
+    if (!article.content.trim()) throw new Error("a knowledge note needs content");
+    await mkdir(this.notes, { recursive: true });
+    const existed = await this.#has(article.id);
+    await this.#write(article, this.notes);
+    const chunks = await this.#rebuildIndex();
+    return { id: article.id, name: article.name, file: `${article.file}.md`, replaced: existed, chunks };
+  }
+
+  async #has(id) {
+    try {
+      return (await readdir(this.notes)).includes(id);
+    } catch {
+      return false;
+    }
+  }
+
+  async #write(article, root) {
+    const directory = resolve(root, article.id);
+    if (dirname(directory) !== root) throw new Error("article path escapes the store");
     // Rewritten from scratch: a rename or a dropped image would otherwise linger.
     await rm(directory, { recursive: true, force: true });
     await mkdir(directory, { recursive: true });
@@ -67,12 +105,24 @@ export class KnowledgeStore {
   }
 
   async #rebuildIndex() {
+    // One index over both roots: what the account shares and what this agent wrote are
+    // the same kind of thing to a search, and `search_knowledge` never had to care.
     const index = [];
+    for (const root of [this.articles, this.notes]) await this.#indexRoot(root, index);
+    const destination = resolve(this.local.knowledge, "index.json");
+    const pending = `${destination}.new`;
+    await writeFile(pending, JSON.stringify(index, null, 2), { mode: 0o600 });
+    await rename(pending, destination);
+    await chmod(destination, 0o600);
+    return index.length;
+  }
+
+  async #indexRoot(root, index) {
     let entries = [];
-    try { entries = await readdir(this.articles, { withFileTypes: true }); } catch { entries = []; }
+    try { entries = await readdir(root, { withFileTypes: true }); } catch { return; }
     for (const entry of entries) {
       if (!entry.isDirectory() || !SAFE_ID.test(entry.name)) continue;
-      const directory = resolve(this.articles, entry.name);
+      const directory = resolve(root, entry.name);
       const file = (await readdir(directory)).find((name) => name.endsWith(".md"));
       if (!file) continue;
       try {
@@ -82,13 +132,12 @@ export class KnowledgeStore {
         this.logger?.log("warning", "knowledge article is unreadable", { id: entry.name, error: String(error) });
       }
     }
-    const destination = resolve(this.local.knowledge, "index.json");
-    const pending = `${destination}.new`;
-    await writeFile(pending, JSON.stringify(index, null, 2), { mode: 0o600 });
-    await rename(pending, destination);
-    await chmod(destination, 0o600);
-    return index.length;
   }
+}
+
+/** `note-<slug>`: stable for a title, and never mistakable for an account article id. */
+export function noteId(name) {
+  return `note-${slug(name).toLowerCase()}`.slice(0, 120);
 }
 
 /** `<Name>.md` is frontmatter plus markdown, the same shape the repository uses. */

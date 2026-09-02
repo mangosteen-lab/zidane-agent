@@ -14,10 +14,12 @@
  * `$5`, and a stray dollar in a shell snippet are ordinary text, and silently mangling
  * them would be worse than not resolving a typo.
  *
- * A couple of commands are built in rather than being skills, because they drive the
- * agent's own machinery rather than describing work: `\watch` and `\unwatch` are how a
- * person starts and stops a follow-up by hand, with the interval they want rather than
- * the one the model would have chosen. They answer to a **backslash, not a dollar** —
+ * A few commands are built in rather than being skills, because they drive the agent's
+ * own machinery rather than describing work: `\watch` and `\unwatch` are how a person
+ * starts and stops a follow-up by hand, with the interval they want rather than the one
+ * the model would have chosen, and `\summarize_skill` and `\summarize_knowledge` are how
+ * a conversation is put away — as a skill a later session can follow, or as an article
+ * `search_knowledge` will turn up. They answer to a **backslash, not a dollar** —
  * `$` means "a skill of mine", and the built-ins are not skills, so a person reading
  * `$watch` would go looking for a skill that does not exist. The two sigils never
  * overlap: `$watch` only ever means a skill called `watch`, and `\pr-fill` names no
@@ -53,6 +55,19 @@ export function parseCommand(text) {
 /** `PR_Fill` and `pr-fill` are the same skill; nothing else is. */
 function normalise(value) {
   return String(value ?? "").trim().toLowerCase().replace(/[\s_]+/g, "-");
+}
+
+/**
+ * The built-in a `\name` asks for, or null.
+ *
+ * Matched through the same normalisation skills get, so `\summarize_skill` and
+ * `\summarize-skill` are one command: a person typing a two-word name should not have to
+ * remember which separator this particular list was written with.
+ */
+export function matchBuiltIn(name) {
+  const wanted = normalise(name);
+  const key = Object.keys(BUILT_INS).find((candidate) => normalise(candidate) === wanted);
+  return key ? { key, command: BUILT_INS[key] } : null;
 }
 
 export function matchSkill(name, skills) {
@@ -124,6 +139,51 @@ export const BUILT_INS = {
       "things stood when you last looked.",
     ].join("\n"),
   },
+  summarize_skill: {
+    description: "Save what this conversation worked out as a reusable skill",
+    usage: "\\summarize_skill [name]",
+    expand: ({ argument, body }) => {
+      const named = [argument, body].filter(Boolean).join("\n\n").trim();
+      return [
+        "The person has asked you to put this conversation away as a skill, so a later session can",
+        "follow it instead of working it out again.",
+        "",
+        named ? `What to call it, or which part to cover: ${named}` : "Name it yourself, after the task it does.",
+        "",
+        "Read back over this conversation and write down the *procedure*, not the story: when the",
+        "skill applies, the steps in order, the commands or paths that actually worked, and the",
+        "mistakes worth avoiding. Leave out what was specific to today — a ticket number, a one-off",
+        "path, anything already obvious. Never write a credential into it.",
+        "",
+        "Then call draft_skill with that name, a one-line description saying when to reach for it,",
+        "and the instructions. Say here what you saved and what it covers. If this conversation",
+        "worked nothing out worth repeating, say so instead of saving an empty skill.",
+      ].join("\n");
+    },
+  },
+  summarize_knowledge: {
+    description: "Write this conversation up as a knowledge article this agent can search",
+    usage: "\\summarize_knowledge [title]",
+    expand: ({ argument, body }) => {
+      const named = [argument, body].filter(Boolean).join("\n\n").trim();
+      return [
+        "The person has asked you to write this conversation up as a knowledge article, so what was",
+        "learned here is findable in every later session rather than living in this one.",
+        "",
+        named ? `What to call it, or which part to cover: ${named}` : "Title it yourself, after the subject rather than after the conversation.",
+        "",
+        "Read back over this conversation and write down what is *true about the thing* — how it is",
+        "laid out, what it expects, what was decided and why, what surprised you. Write it for",
+        "somebody who was not here: say what the subject is before saying what was done to it, and",
+        "do not refer to \"we\" or to this conversation. Leave out the back-and-forth and anything",
+        "already obvious. Never write a credential into it.",
+        "",
+        "Then call draft_knowledge with that title, a one-line description, and the article. Say here",
+        "what you saved. If this conversation established nothing worth keeping, say so instead of",
+        "saving an empty article.",
+      ].join("\n");
+    },
+  },
 };
 
 /**
@@ -141,11 +201,11 @@ export async function expandCommand(text, skillRoot) {
   const parsed = parseCommand(text);
   if (!parsed) return { text, skill: null, unknown: null };
   if (parsed.sigil === "\\") {
-    const builtIn = BUILT_INS[parsed.name.toLowerCase()];
+    const builtIn = matchBuiltIn(parsed.name);
     // An unknown `\word` is left alone, the same leniency `$HOME` gets: a backslash in
     // front of a word is ordinary enough in prose and in a code snippet.
     if (!builtIn) return { text, skill: null, unknown: null };
-    return { text: builtIn.expand(parsed), skill: `\\${parsed.name.toLowerCase()}`, unknown: null };
+    return { text: builtIn.command.expand(parsed), skill: `\\${builtIn.key}`, unknown: null };
   }
   let skills = [];
   try { skills = await discoverSkills(skillRoot); }

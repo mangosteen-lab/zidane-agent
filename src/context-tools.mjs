@@ -5,7 +5,7 @@ import { Type } from "typebox";
 import { MAX_MINUTES, MIN_MINUTES } from "./follow-up.mjs";
 
 export function contextTools(local, memory, data, session = {}) {
-  const { conversation = "", followUps = null } = session;
+  const { conversation = "", followUps = null, knowledge = null } = session;
   return [
     // A conversation can ask to be woken later. Only where there is a conversation to
     // wake: a summary or a compaction has nowhere to come back to.
@@ -82,6 +82,34 @@ export function contextTools(local, memory, data, session = {}) {
           skill_id: result.item.skill_id,
           replaced: Boolean(existing),
         });
+      },
+    })] : []),
+    ...(knowledge ? [defineTool({
+      name: "draft_knowledge",
+      label: "Draft knowledge article",
+      description:
+        "Write what this session learned into this agent's own knowledge library, as an article that "
+        + "`search_knowledge` finds in every later session and every conversation. Use it for durable "
+        + "reference material — how a system is laid out, what an interface expects, a decision and the "
+        + "reason for it — where `draft_skill` is for a procedure worth repeating and `remember` is for a "
+        + "short fact. Write it for somebody who was not in this conversation: say what the thing is "
+        + "before what was done to it. Saving a title that already exists replaces that article. "
+        + "This is the agent's own copy — it is not shared with the account, and an account article is "
+        + "never overwritten by it. Never put a credential in one.",
+      parameters: Type.Object({
+        name: Type.String({ minLength: 1, maxLength: 200 }),
+        description: Type.String({ minLength: 1, maxLength: 2_000 }),
+        content: Type.String({ minLength: 1, maxLength: 200_000 }),
+        tags: Type.Optional(Type.Array(Type.String({ maxLength: 80 }), { maxItems: 20 })),
+      }),
+      execute: async (_id, args) => {
+        const record = await knowledge.note(args);
+        return text(
+          `${record.replaced ? "Replaced" : "Saved"} the knowledge article “${record.name}”. `
+          + "Later sessions find it with search_knowledge. It stays on this agent — promote it from the "
+          + "console if the account should have it.",
+          { id: record.id, replaced: record.replaced },
+        );
       },
     })] : []),
     defineTool({

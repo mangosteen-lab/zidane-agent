@@ -104,6 +104,36 @@ test("\\watch carries the person's own interval, and needs no skill installed", 
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("\\summarize_skill and \\summarize_knowledge put a conversation away", async () => {
+  const root = await skillRoot([]);
+  try {
+    const asSkill = await expandCommand("\\summarize_skill deploy-the-worker", root);
+    assert.equal(asSkill.skill, "\\summarize_skill");
+    assert.match(asSkill.text, /call draft_skill/);
+    // What they typed after the command is the name to use, not a new instruction.
+    assert.match(asSkill.text, /What to call it, or which part to cover: deploy-the-worker/);
+    // A procedure, not a retelling — and never a credential.
+    assert.match(asSkill.text, /procedure., not the story/);
+    assert.match(asSkill.text, /Never write a credential/);
+
+    const asArticle = await expandCommand("\\summarize_knowledge How the worker is wired", root);
+    assert.equal(asArticle.skill, "\\summarize_knowledge");
+    assert.match(asArticle.text, /call draft_knowledge/);
+    assert.match(asArticle.text, /How the worker is wired/);
+    assert.match(asArticle.text, /somebody who was not here/);
+
+    // Nothing after the command: it names the thing itself rather than refusing.
+    assert.match((await expandCommand("\\summarize_skill", root)).text, /Name it yourself/);
+    assert.match((await expandCommand("\\summarize_knowledge", root)).text, /Title it yourself/);
+
+    // One command, whichever separator was typed — and it is still a built-in, so it
+    // works on an agent carrying no skills at all.
+    const hyphenated = await expandCommand("\\summarize-knowledge", root);
+    assert.equal(hyphenated.skill, "\\summarize_knowledge");
+    assert.match(hyphenated.text, /call draft_knowledge/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("the two sigils never reach into each other", async () => {
   const root = await skillRoot(["watch"]);
   try {
