@@ -254,7 +254,7 @@ curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/zidane-agent/main/sc
 ```
 
 To pin a release rather than follow `main`, use its tag in the URL, e.g.
-`https://raw.githubusercontent.com/mangosteen-lab/zidane-agent/v1.2.0/scripts/install-container.sh`.
+`https://raw.githubusercontent.com/mangosteen-lab/zidane-agent/v1.3.0/scripts/install-container.sh`.
 
 It asks for a container name, the agent's name, the server URL (`wss://host` or the
 console's `https://host` — the `/ws/agent` path is added), the registration key the console
