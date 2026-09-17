@@ -1,8 +1,7 @@
-import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { MAX_MINUTES, MIN_MINUTES } from "./follow-up.mjs";
+import { readIndex } from "./recall.mjs";
 
 export function contextTools(local, memory, data, session = {}) {
   const { conversation = "", followUps = null, knowledge = null } = session;
@@ -132,7 +131,10 @@ export function contextTools(local, memory, data, session = {}) {
     defineTool({
       name: "retrieve_memory",
       label: "Retrieve memory",
-      description: "Retrieve relevant non-restricted durable memories with memory IDs.",
+      description:
+        "Search the durable memory earlier sessions left: facts, fixes, daily summaries, and summaries "
+        + "of past conversations, with memory IDs. Search before starting a task, and again after a "
+        + "command or tool fails — the same task or failure may already have been handled.",
       parameters: Type.Object({
         query: Type.String({ minLength: 1, maxLength: 1_000 }),
         limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
@@ -155,13 +157,16 @@ export function contextTools(local, memory, data, session = {}) {
     defineTool({
       name: "search_knowledge",
       label: "Search knowledge",
-      description: "Search indexed knowledge sources and return cited snippets.",
+      description:
+        "Search the knowledge articles shared with this agent and the ones it wrote itself, returning "
+        + "cited snippets. Search before starting a task about a system, repository, or interface, and "
+        + "after a failure that reference material might explain.",
       parameters: Type.Object({
         query: Type.String({ minLength: 1 }),
         limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
       }),
       execute: async (_id, args) => {
-        const index = await loadIndex(local);
+        const index = await readIndex(local);
         const terms = tokens(args.query);
         const matches = index
           .map((item) => ({ item, score: score(`${item.title ?? ""} ${item.text ?? ""}`, terms) }))
@@ -200,15 +205,6 @@ function skillMarkdown(name, description, instructions) {
 function yamlScalar(value) {
   const flat = String(value).replace(/\s+/g, " ").trim();
   return /^[A-Za-z0-9][A-Za-z0-9 ._,'()/-]*$/.test(flat) ? flat : JSON.stringify(flat);
-}
-
-async function loadIndex(local) {
-  try {
-    const value = JSON.parse(await readFile(resolve(local.knowledge, "index.json"), "utf8"));
-    return Array.isArray(value) ? value : [];
-  } catch {
-    return [];
-  }
 }
 
 function tokens(input) {

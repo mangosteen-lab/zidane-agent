@@ -177,6 +177,30 @@ instead of the work is a wake that has lost what it was watching.
 `follow-ups/pending.json` and survive a restart — an agent that was down comes back to one
 overdue wake per conversation, not one for every interval it missed.
 
+## Recalling what it already knows
+
+Memory and knowledge are no use if a session never reads them, and a model left to call
+`retrieve_memory` by itself mostly does not. So every working session — a prompt, a
+check-back wake, a scheduled run — recalls at two moments it cannot skip (`recall.mjs`,
+registered as an inline Pi extension):
+
+- **Before a task.** The prompt is matched against memory and the knowledge index, and
+  what clears the bar is attached beside it as a hidden note (`zidane.recall`), with each
+  entry's id.
+- **After an error.** When any tool fails, its command and error output are matched the
+  same way and what is found is appended to the result the model reads — so a
+  `Permission denied (publickey)` arrives together with the note that says which key fixed
+  it last time.
+
+The system prompt gains a short section telling the model to act on those notes, and to
+search with `retrieve_memory`/`search_knowledge` itself before a task and after a failure
+when recall found nothing. Matching weighs each word by how rare it is and needs several
+shared words, so ordinary chatter and a harmless `grep` miss recall nothing; at most three
+memories and two articles are shown, restricted memory never is, and a note the
+conversation's context already holds is not repeated. Summaries and compactions run
+without recall, so notes from other conversations are never folded into them. A recall
+that fails is logged and skipped.
+
 ## `$skill` and `\built-in` commands
 
 A prompt may open with `$name args…`, which means "do this with that skill":

@@ -1,5 +1,6 @@
 import { readFile, rename, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { rank } from "./recall.mjs";
 
 const SENSITIVITY = new Set(["normal", "private", "restricted"]);
 const MAX_MEMORIES = 10_000;
@@ -65,6 +66,26 @@ export class MemoryStore {
     });
   }
 
+  /**
+   * The memories most relevant to a prompt or an error, for recall nobody asked for.
+   *
+   * Stricter than `query` — see `recall.mjs` — and it writes nothing when nothing
+   * matched, since it runs on every prompt and every failed tool.
+   */
+  recall(text, limit = 3, exclude = new Set()) {
+    return this.#mutate(async (entries) => {
+      const candidates = entries.filter((entry) => entry.sensitivity !== "restricted" && !exclude.has(entry.id));
+      const matches = rank(candidates, text, (entry) => `${entry.text} ${entry.tags.join(" ")}`).slice(0, limit);
+      if (!matches.length) return { result: [], entries: null };
+      const accessed = Date.now();
+      for (const entry of matches) {
+        entry.access_count = (entry.access_count ?? 0) + 1;
+        entry.last_accessed_at = accessed;
+      }
+      return { result: matches.map(publicMemory), entries };
+    });
+  }
+
   delete(memoryId) {
     return this.#mutate(async (entries) => {
       const kept = entries.filter((entry) => entry.id !== memoryId);
@@ -77,7 +98,7 @@ export class MemoryStore {
       const entries = await this.#load();
       const active = entries.filter((entry) => !entry.expires_at || entry.expires_at > Date.now());
       const { result, entries: updated } = await operation(active);
-      await this.#save(updated);
+      if (updated) await this.#save(updated);
       return result;
     });
     this.#pending = task.catch(() => undefined);

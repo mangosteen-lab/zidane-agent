@@ -5,12 +5,15 @@ import { discoverSkills } from "./agent-data.mjs";
 import { expandCommand, looksLikeCommand } from "./commands.mjs";
 import { readSecretValue, resolveLlmProfile } from "./config.mjs";
 import { contextTools } from "./context-tools.mjs";
+import { recallExtension, recallGuidance } from "./recall.mjs";
 import { prepareSandbox, sandboxTools } from "./sandbox.mjs";
 
 const COMPACT_PROMPT = `Summarise this entire conversation as a durable note for your future self.
 Capture the decisions reached, the constraints discovered, and anything you would need to
 resume this work later. Leave out pleasantries and anything already obvious. Write prose,
 no more than 300 words, and include no credentials or secret values.`;
+
+const DEFAULT_TOOLS = ["read", "grep", "find", "ls", "write", "edit", "bash", "remember", "retrieve_memory", "forget_memory", "search_knowledge", "draft_skill", "draft_knowledge", "check_back", "stop_checking"];
 
 /** Why a prompt was refused, so the control plane can decide whether to queue it. */
 export class BusyError extends Error {
@@ -82,7 +85,8 @@ export class PiRuntime {
     this.#running.add(conversation);
     try {
       const workspace = resolve(this.local.workspaces, conversation);
-      const { session } = await this.#session(conversation, workspace, {});
+      // No recall: notes from other conversations would be summarised as if they were this one's.
+      const { session } = await this.#session(conversation, workspace, {}, { recall: false });
       let text = "";
       session.subscribe((event) => {
         if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
@@ -102,7 +106,8 @@ export class PiRuntime {
     this.#running.add(conversation);
     try {
       const workspace = resolve(this.local.workspaces, conversation);
-      const { session } = await this.#session(conversation, workspace, {});
+      // No recall: notes from other conversations would be summarised as if they were this one's.
+      const { session } = await this.#session(conversation, workspace, {}, { recall: false });
       let summary = "";
       session.subscribe((event) => {
         if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
@@ -161,7 +166,7 @@ export class PiRuntime {
       if (staged) await stageSkills(this.local.skills, skills, staged);
       let profile = {};
       try { profile = await resolveLlmProfile(this.local); } catch { profile = {}; }
-      const { session } = await this.#session(conversation, workspace, profile, staged ? [staged] : [this.local.skills]);
+      const { session } = await this.#session(conversation, workspace, profile, { skillPaths: staged ? [staged] : [this.local.skills] });
       let text = "";
       session.subscribe((event) => {
         if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
@@ -190,8 +195,13 @@ export class PiRuntime {
     return true;
   }
 
-  /** Everything a prompt needs before it can be sent: workspace, model, session. */
-  async #session(conversation, workspace, profile, skillPaths = [this.local.skills]) {
+  /**
+   * Everything a prompt needs before it can be sent: workspace, model, session.
+   *
+   * `recall` is on for every session that does work — a prompt, a wake, a scheduled run —
+   * and off only for summarising, where recalled notes would leak into the summary.
+   */
+  async #session(conversation, workspace, profile, { skillPaths = [this.local.skills], recall = true } = {}) {
     await mkdir(workspace, { recursive: true });
     // $TMPDIR points inside the workspace, so scratch dies with the conversation instead
     // of piling up in the container. $HOME is the agent's shared session home, which is
@@ -201,12 +211,14 @@ export class PiRuntime {
     if (profile.provider && profile.secret_value) {
       await runtime.setRuntimeApiKey(profile.provider, readSecretValue(profile.secret_value));
     }
+    const tools = profile.tools?.length ? profile.tools : DEFAULT_TOOLS;
     const soul = await readFile(this.local.soul, "utf8");
     const loader = new DefaultResourceLoader({
       cwd: workspace,
       agentDir: this.local.root,
-      systemPromptOverride: () => soul,
+      systemPromptOverride: () => (recall ? `${soul.trimEnd()}\n\n${recallGuidance(tools)}\n` : soul),
       additionalSkillPaths: skillPaths,
+      extensionFactories: recall ? [recallExtension({ memory: this.memory, local: this.local, logger: this.logger })] : [],
     });
     await loader.reload();
     const model = profile.provider && profile.model ? runtime.getModel(profile.provider, profile.model) : undefined;
@@ -219,7 +231,7 @@ export class PiRuntime {
       thinkingLevel: profile.thinking_level ?? "medium",
       modelRuntime: runtime,
       resourceLoader: loader,
-      tools: profile.tools?.length ? profile.tools : ["read", "grep", "find", "ls", "write", "edit", "bash", "remember", "retrieve_memory", "forget_memory", "search_knowledge", "draft_skill", "draft_knowledge", "check_back", "stop_checking"],
+      tools,
       // The sandboxed bash/write/edit shadow Pi's built-ins of the same name.
       customTools: [
         ...sandboxTools(workspace, sandbox),
