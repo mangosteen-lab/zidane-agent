@@ -1,9 +1,12 @@
 import { access, chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
-import { constants } from "node:fs";
+import { constants, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { loadEnvFile, readEnvFile, writeEnvFile } from "./dotenv.mjs";
 
 const DEFAULT_WORKDIR = "/var/lib/zidane-agent";
+// Reported to the control plane unless ZIDANE_AGENT_VERSION says otherwise, so an agent
+// shows the release it is actually running.
+const PACKAGE_VERSION = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 
 export function configFromEnv(env = process.env) {
   const workingDirectory = resolve(env.ZIDANE_AGENT_WORKING_DIRECTORY ?? DEFAULT_WORKDIR);
@@ -20,7 +23,7 @@ export function configFromEnv(env = process.env) {
   }
   return {
     name: env.ZIDANE_AGENT_NAME ?? "zidane-agent",
-    version: env.ZIDANE_AGENT_VERSION ?? "1.0.0",
+    version: env.ZIDANE_AGENT_VERSION ?? PACKAGE_VERSION,
     description: env.ZIDANE_AGENT_DESCRIPTION ?? "Autonomous Pi coding agent",
     apiKey, serverUrl, capacity, workingDirectory,
   };

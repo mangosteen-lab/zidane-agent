@@ -13,7 +13,7 @@ back. Capacity controls how many Pi sessions may run concurrently.
 | `ZIDANE_AGENT_SERVER_URL` | required | `wss://.../ws/agent` endpoint |
 | `ZIDANE_AGENT_API_KEY` | required | Registration key shown once by the server |
 | `ZIDANE_AGENT_NAME` | `zidane-agent` | Initial unique name within the user account |
-| `ZIDANE_AGENT_VERSION` | `1.0.0` | Reported version |
+| `ZIDANE_AGENT_VERSION` | `package.json` version | Reported version |
 | `ZIDANE_AGENT_DESCRIPTION` | `Autonomous Pi coding agent` | Operator-facing description |
 | `ZIDANE_AGENT_CAPACITY` | `1` | Maximum concurrent Pi sessions |
 | `ZIDANE_AGENT_WORKING_DIRECTORY` | `/var/lib/zidane-agent` | Durable local state root |
@@ -244,6 +244,52 @@ npm audit --audit-level=high
 ```
 
 ## Installation
+
+### One-line container install
+
+On a Linux host with Docker, as root:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/zidane-agent/main/scripts/install-container.sh | sudo bash
+```
+
+To pin a release rather than follow `main`, use its tag in the URL, e.g.
+`https://raw.githubusercontent.com/mangosteen-lab/zidane-agent/v1.1.0/scripts/install-container.sh`.
+
+It asks for a container name, the agent's name, the server URL (`wss://host` or the
+console's `https://host` — the `/ws/agent` path is added), the registration key the console
+showed once, a description, and the session capacity. It then pulls
+`ghcr.io/mangosteen-lab/zidane-agent:<release>` and starts the container with
+`--restart unless-stopped`, its state bind-mounted from the host:
+
+```text
+/opt/mangosteen/zidane-agent-<container>        agent working directory (owned by the image's user, 0700)
+/opt/mangosteen/zidane-agent-<container>.env    settings, including the key (root, 0600)
+```
+
+A server on the host's own `localhost` gets the host network, since `localhost` inside the
+container is the container. Every answer can be passed instead, which is how it runs
+unattended — see `--help`:
+
+```bash
+curl -fsSL .../install-container.sh | sudo bash -s -- --yes \
+  --container qa --name qa-agent --server-url wss://zidane.example.com --api-key zidane_...
+```
+
+Running the installer again for the same container upgrades it: the saved settings are the
+defaults, the key is kept unless a new one is entered, and the state directory is untouched.
+To remove one:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/zidane-agent/main/scripts/uninstall-container.sh | sudo bash -s -- <container>
+```
+
+The container is removed; its state and settings are kept unless `--purge` is given (or
+you confirm deleting them by typing the container name), so reinstalling under the same
+name picks the agent's memory, skills and credentials back up. `--remove-image` also
+removes the image when nothing else uses it.
+
+### Building the image yourself
 
 The container uses Ubuntu 24.04, installs Node.js 22 and common coding tools, runs as the
 unprivileged `zidane` user, and persists `/var/lib/zidane-agent`:
