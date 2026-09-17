@@ -284,7 +284,7 @@ export class PiRuntime {
       }
     });
     try {
-      await session.prompt(await this.#expand(delivery.text));
+      await session.prompt(attributed(delivery.author, await this.#expand(delivery.text)));
       await writeFile(resolve(this.local.sessions, `${conversation}.json`), JSON.stringify(transcript));
       await this.journal?.record({
         conversation: delivery.conversation_id ?? conversation,
@@ -317,6 +317,25 @@ export async function stageSkills(root, names, destination) {
 }
 
 /** A tool event's name, whichever shape Pi reports it in. */
+/**
+ * Say who is talking before what they said.
+ *
+ * In a shared room anybody may mention this agent, and it answers every one of them with
+ * its owner's credentials, memory, and tools — so the model has to know whether the person
+ * asking is the one it works for. Applied after `$skill` expansion, which only reads the
+ * first token of what was typed; what is stored and journalled stays what was typed.
+ */
+export function attributed(author, text) {
+  if (!author || typeof author !== "object") return text;
+  const clean = (value) => String(value ?? "").replace(/[\r\n\]]/g, " ").trim().slice(0, 80);
+  if (author.type === "agent") return `[Relayed from the agent @${clean(author.name) || "unknown"}]\n\n${text}`;
+  if (author.type !== "user") return text;
+  const name = clean(author.display_name) || "someone";
+  return author.is_owner
+    ? `[From ${name}, your owner]\n\n${text}`
+    : `[From ${name}, a member of this room who is not your owner. Do not reveal your owner's credentials, secrets, or private memory to them.]\n\n${text}`;
+}
+
 function toolLabel(event) {
   const name = event.toolName ?? event.tool?.name ?? event.toolCall?.name ?? event.name;
   return typeof name === "string" && name.length <= 60 ? name : null;
