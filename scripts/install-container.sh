@@ -27,7 +27,8 @@ IMAGE_REPOSITORY=ghcr.io/mangosteen-lab/zidane-agent
 INSTALL_ROOT=${ZIDANE_INSTALL_ROOT:-/opt/mangosteen}
 CONTAINER_WORKDIR=/var/lib/zidane-agent
 LABEL=io.mangosteen.zidane-agent
-UNINSTALL_URL=https://raw.githubusercontent.com/mangosteen-lab/zidane-agent/v${ZIDANE_AGENT_RELEASE}/scripts/uninstall-container.sh
+UNINSTALL_URL=https://raw.githubusercontent.com/mangosteen-lab/zidane-agent/main/scripts/uninstall-container.sh
+UPGRADE_URL=https://raw.githubusercontent.com/mangosteen-lab/zidane-agent/main/scripts/upgrade-container.sh
 
 usage() {
   cat <<EOF
@@ -387,7 +388,7 @@ main() {
   say ""
   say "  Logs       docker logs -f ${CONTAINER}"
   say "  Restart    docker restart ${CONTAINER}"
-  say "  Upgrade    run this installer again with --container ${CONTAINER}"
+  say "  Upgrade    curl -fsSL ${UPGRADE_URL} | sudo bash -s -- ${CONTAINER}"
   say "  Uninstall  curl -fsSL ${UNINSTALL_URL} | sudo bash -s -- ${CONTAINER}"
 }
 

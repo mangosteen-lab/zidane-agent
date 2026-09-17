@@ -276,9 +276,22 @@ curl -fsSL .../install-container.sh | sudo bash -s -- --yes \
   --container qa --name qa-agent --server-url wss://zidane.example.com --api-key zidane_...
 ```
 
-Running the installer again for the same container upgrades it: the saved settings are the
-defaults, the key is kept unless a new one is entered, and the state directory is untouched.
-To remove one:
+To upgrade an installed agent to the latest release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/zidane-agent/main/scripts/upgrade-container.sh | sudo bash -s -- <container>
+```
+
+It finds the newest release (GitHub's latest release, or the highest version tag on the
+image), downloads that release's own `install-container.sh`, and runs it unattended against
+the container: the saved settings are reused, the new image is pulled, the container is
+replaced, and the state directory is untouched. A container already on that release is
+left alone; if the new one does not stay up, the previous image is put back. `--all`
+upgrades every installed agent, `--version 1.1.0` picks a release, `--yes` skips the
+confirmation, and moving to an older release needs `--force`.
+
+Running the installer again for the same container does the same with the installer you
+run, and lets you change the settings. To remove one:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/zidane-agent/main/scripts/uninstall-container.sh | sudo bash -s -- <container>

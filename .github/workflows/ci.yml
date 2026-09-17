@@ -20,5 +20,5 @@ jobs:
       - run: npm run check
       - run: npm test
       - run: npm audit --audit-level=high
-      - run: bash -n scripts/install-linux.sh scripts/install-macos.sh scripts/run-with-env.sh scripts/install-container.sh scripts/uninstall-container.sh
+      - run: bash -n scripts/install-linux.sh scripts/install-macos.sh scripts/run-with-env.sh scripts/install-container.sh scripts/uninstall-container.sh scripts/upgrade-container.sh
       - run: docker build -t zidane-agent:ci .

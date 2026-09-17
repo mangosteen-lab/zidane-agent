@@ -31,3 +31,21 @@ test("state lives under /opt/mangosteen/zidane-agent-<container>", () => {
   assert.equal(helper("data_dir_for zidane-agent-qa"), "/opt/mangosteen/zidane-agent-qa");
   assert.equal(helper('valid_container "../etc" || echo invalid'), "invalid");
 });
+
+const upgrade = new URL("../scripts/upgrade-container.sh", import.meta.url).pathname;
+
+function upgradeHelper(expression) {
+  return execFileSync("bash", ["-c", `set -euo pipefail; . "$1"; ${expression}`, "bash", upgrade], {
+    env: { ...process.env, ZIDANE_INSTALL_SOURCE_ONLY: "1" },
+    encoding: "utf8",
+  }).trim();
+}
+
+test("an upgrade picks the highest release and reads the one a container runs", () => {
+  assert.equal(upgradeHelper("printf '%s\\n' latest 0.0.2 1.10.0 1.9.3 1.2.0-rc1 | highest_version"), "1.10.0");
+  assert.equal(upgradeHelper("older_than 1.9.3 1.10.0 && echo older"), "older");
+  assert.equal(upgradeHelper("older_than 1.10.0 1.10.0 || echo same"), "same");
+  assert.equal(upgradeHelper("version_of ghcr.io/mangosteen-lab/zidane-agent:1.1.0"), "1.1.0");
+  assert.equal(upgradeHelper("version_of ghcr.io/mangosteen-lab/zidane-agent:latest || echo none"), "none");
+  assert.equal(upgradeHelper("version_of registry.local:5000/zidane-agent || echo none"), "none");
+});
