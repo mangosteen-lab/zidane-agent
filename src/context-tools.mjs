@@ -4,8 +4,31 @@ import { MAX_MINUTES, MIN_MINUTES } from "./follow-up.mjs";
 import { readIndex } from "./recall.mjs";
 
 export function contextTools(local, memory, data, session = {}) {
-  const { conversation = "", followUps = null, knowledge = null } = session;
+  const { conversation = "", followUps = null, knowledge = null, react = null } = session;
   return [
+    // Marking the message being answered, the way a person in a chat room does. Only
+    // where there is a delivery to mark: a summary or a scheduled run answers nobody.
+    ...(react ? [defineTool({
+      name: "react",
+      label: "React to the message",
+      description:
+        "Put an emoji on the message you are answering, the way somebody in a chat room does. "
+        + "The person asking sees it on their own message straight away, long before your reply — "
+        + "so use it to say what is happening while it happens: that you have understood and are "
+        + "starting, that something is building or running, that you found what was asked for, that "
+        + "you are blocked on something. One emoji per call, and call it again to add another or to "
+        + "take one off. The eyes are already put there for you when the message reaches you, so do "
+        + "not add those. This is a signal, not a reply: it never carries an answer, an explanation "
+        + "or an apology, and it does not replace saying what you did when you finish.",
+      parameters: Type.Object({
+        emoji: Type.String({ minLength: 1, maxLength: 8 }),
+        remove: Type.Optional(Type.Boolean()),
+      }),
+      execute: async (_id, args) => {
+        react(args.emoji, Boolean(args.remove));
+        return text(args.remove ? `Took ${args.emoji} off the message.` : `Put ${args.emoji} on the message.`);
+      },
+    })] : []),
     // A conversation can ask to be woken later. Only where there is a conversation to
     // wake: a summary or a compaction has nowhere to come back to.
     ...(followUps && conversation ? [defineTool({

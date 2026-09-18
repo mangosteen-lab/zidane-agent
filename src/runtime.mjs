@@ -13,7 +13,7 @@ Capture the decisions reached, the constraints discovered, and anything you woul
 resume this work later. Leave out pleasantries and anything already obvious. Write prose,
 no more than 300 words, and include no credentials or secret values.`;
 
-const DEFAULT_TOOLS = ["read", "grep", "find", "ls", "write", "edit", "bash", "remember", "retrieve_memory", "forget_memory", "search_knowledge", "draft_skill", "draft_knowledge", "check_back", "stop_checking"];
+const DEFAULT_TOOLS = ["read", "grep", "find", "ls", "write", "edit", "bash", "remember", "retrieve_memory", "forget_memory", "search_knowledge", "draft_skill", "draft_knowledge", "check_back", "stop_checking", "react"];
 
 /** Why a prompt was refused, so the control plane can decide whether to queue it. */
 export class BusyError extends Error {
@@ -201,7 +201,7 @@ export class PiRuntime {
    * `recall` is on for every session that does work — a prompt, a wake, a scheduled run —
    * and off only for summarising, where recalled notes would leak into the summary.
    */
-  async #session(conversation, workspace, profile, { skillPaths = [this.local.skills], recall = true } = {}) {
+  async #session(conversation, workspace, profile, { skillPaths = [this.local.skills], recall = true, delivery = "" } = {}) {
     await mkdir(workspace, { recursive: true });
     // $TMPDIR points inside the workspace, so scratch dies with the conversation instead
     // of piling up in the container. $HOME is the agent's shared session home, which is
@@ -241,6 +241,11 @@ export class PiRuntime {
           conversation,
           followUps: this.followUps,
           knowledge: this.knowledge,
+          // A session can only mark the message it was given: the delivery is the
+          // control plane's own handle on it, and the agent never sees a message id.
+          react: delivery
+            ? (emoji, remove) => this.emit("REACT", { delivery_id: delivery, emoji, remove })
+            : null,
         }),
       ],
     });
@@ -268,7 +273,7 @@ export class PiRuntime {
     let profile = {};
     try { profile = await resolveLlmProfile(this.local, delivery.profile_id); }
     catch { profile = {}; }
-    const { session } = await this.#session(conversation, workspace, profile);
+    const { session } = await this.#session(conversation, workspace, profile, { delivery: delivery.delivery_id });
     entry.session = session;
     if (entry.cancelled) await session.abort();
     const transcript = [];
