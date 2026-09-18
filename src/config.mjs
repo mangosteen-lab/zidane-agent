@@ -36,6 +36,10 @@ export function paths(config) {
     skills: resolve(root, "skills"), memory: resolve(root, "memory"),
     knowledge: resolve(root, "knowledge"), config: resolve(root, "config"),
     configMaps: resolve(root, "config-maps"),
+    // A skill and a config map bound together in one folder, plus a health check and an
+    // expiry. A session's skill paths include this, so a connector's SKILL.md is found
+    // by the machinery skills already use. See `connectors.mjs`.
+    connectors: resolve(root, "connectors"),
     crontab: resolve(root, "crontab"),
     sessions: resolve(root, "sessions"),
     auth: resolve(root, "auth"),

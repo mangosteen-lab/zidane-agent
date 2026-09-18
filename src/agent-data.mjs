@@ -57,9 +57,14 @@ export function withSkillIdentity(content, id) {
 export class AgentDataStore {
   #pending = Promise.resolve();
 
-  constructor(local, knowledge, cron, followUps = null) {
+  constructor(local, knowledge, cron, followUps = null, connectors = null) {
     this.local = local;
     this.knowledge = knowledge;
+    // Connectors are their own store — a folder per connector rather than a file — but
+    // they relay over the same channel, so the dispatcher hands `connector.*` straight
+    // through. Passed in rather than imported: `connectors.mjs` reads skill identity
+    // from here, and a cycle between the two would be needless.
+    this.connectors = connectors;
     // Present only where a scheduler is running; the REST relay reports the operation as
     // unsupported rather than pretending a task was stored on an agent that cannot run it.
     this.cron = cron;
@@ -103,8 +108,30 @@ export class AgentDataStore {
     if (operation === "follow-up.cancel") {
       return { cancelled: await this.#followUps().cancel(String(input.conversation_id ?? "")) };
     }
+    if (operation.startsWith("connector.")) return this.#connectors().handle(operation, input);
     if (operation === "account.refresh") return this.#refreshAccountResources(input);
     throw new Error(`unsupported agent data operation: ${operation}`);
+  }
+
+  #connectors() {
+    if (!this.connectors) throw new Error("connectors are not available on this agent");
+    return this.connectors;
+  }
+
+  /**
+   * Every value name a config map owns, for the connector store's collision check.
+   *
+   * One namespace reaches `process.env`, so a name has exactly one owner; this is the
+   * half of that rule the connector store cannot see for itself.
+   */
+  async configValueClaims() {
+    const claims = new Map();
+    for (const item of await this.#loadConfigs()) {
+      for (const key of [...Object.keys(item.normal_values), ...item.secret_values]) {
+        claims.set(key, `the ${item.name} config map`);
+      }
+    }
+    return claims;
   }
 
   #cron() {
@@ -359,9 +386,25 @@ export class AgentDataStore {
     await atomicJson(this.#configPath(name), record, 0o600);
   }
 
+  /**
+   * Refuse a value name a connector already owns.
+   *
+   * The mirror of `ConnectorStore#claim`. Enforcing it on one side only would leave the
+   * hole open from the other: create the config map second and it silently wins.
+   */
+  async #assertUnclaimed(record) {
+    if (!this.connectorValueClaims) return;
+    const claims = await this.connectorValueClaims();
+    for (const key of [...Object.keys(record.normal_values), ...record.secret_values]) {
+      const owner = claims.get(key);
+      if (owner) throw new Error(`${key} is already provided by ${owner}; give this config map a value name of its own`);
+    }
+  }
+
   async #createConfig(input) {
     const name = validConfigName(input.name);
     if (await this.#findConfig(name)) throw new Error("a config map with this name already exists");
+    await this.#assertUnclaimed(this.#configRecord(null, input));
     await this.#applySecretEntries(input.secret_entries);
     await this.#writeConfig(name, this.#configRecord(null, input));
     await this.#applyConfigs();
@@ -381,6 +424,7 @@ export class AgentDataStore {
     if (name !== current.name && await this.#findConfig(name)) {
       throw new Error("a config map with this name already exists");
     }
+    await this.#assertUnclaimed(this.#configRecord(current, input));
     await this.#applySecretEntries(input.secret_entries);
     await this.#writeConfig(name, this.#configRecord(current, input));
     if (name !== current.name) await rm(this.#configPath(current.name), { force: true });

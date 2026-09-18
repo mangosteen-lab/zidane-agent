@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import process from "node:process";
 import WebSocket from "ws";
 import { AgentDataStore } from "./agent-data.mjs";
+import { ConnectorStore, ConnectorWatcher } from "./connectors.mjs";
 import {
   applyAgentInfo,
   applyResource,
@@ -82,7 +83,21 @@ const followUps = new FollowUpStore(local);
 const followUpScheduler = new FollowUpScheduler(followUps, runtime, logger, {
   intervalMs: (Number.parseInt(process.env.ZIDANE_AGENT_FOLLOW_UP_INTERVAL_SECONDS ?? "30", 10) || 30) * 1_000,
 });
-const agentData = new AgentDataStore(local, knowledge, cron, followUps);
+// A connector is a skill and a config map in one folder, with a health check and an
+// expiry. Its collision check has to see config-map value names too, and the data store
+// is built from it, so the claim lookup is late-bound rather than passed by value.
+const connectors = new ConnectorStore(local, async () => agentData.configValueClaims());
+const agentData = new AgentDataStore(local, knowledge, cron, followUps, connectors);
+agentData.connectorValueClaims = () => connectors.valueClaims();
+// Secret values arrive from `config-maps/.env`; a connector's ordinary values live in
+// its record, so they are replayed into the environment on the way up.
+await connectors.apply();
+// A credential that stopped working is worth knowing about before somebody depends on
+// it. The check is declarative and costs no model call, so it runs outside capacity;
+// only a transition is reported, and `unconfigured` never is.
+const connectorWatcher = new ConnectorWatcher(connectors, send, logger, {
+  intervalMs: (Number.parseInt(process.env.ZIDANE_AGENT_CONNECTOR_INTERVAL_SECONDS ?? "60", 10) || 60) * 1_000,
+});
 // A session saves a skill through the same store the REST relay uses.
 runtime.data = agentData;
 runtime.followUps = followUps;
@@ -98,6 +113,7 @@ try {
 await knowledge.start();
 if ((process.env.ZIDANE_AGENT_CRON ?? "true") !== "false") cron.start();
 if ((process.env.ZIDANE_AGENT_FOLLOW_UPS ?? "true") !== "false") followUpScheduler.start();
+if ((process.env.ZIDANE_AGENT_CONNECTOR_CHECKS ?? "true") !== "false") connectorWatcher.start();
 
 // The day's work is summarised into memory once the day is over. Checked on a slow
 // timer rather than scheduled for an hour: an agent that was asleep at midnight, or
@@ -481,7 +497,7 @@ async function connect() {
       capabilities: {
         pi_sdk: true,
         parallel_sessions: config.capacity,
-        agent_storage: { version: 6, resources: ["skills", "config_maps", "secrets", "llm_profiles", "crontab", "follow_ups"] },
+        agent_storage: { version: 7, resources: ["skills", "config_maps", "connectors", "secrets", "llm_profiles", "crontab", "follow_ups"] },
         providers: modelCatalog.map((provider) => provider.id),
         model_catalog: modelCatalog,
       },

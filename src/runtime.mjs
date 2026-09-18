@@ -201,7 +201,9 @@ export class PiRuntime {
    * `recall` is on for every session that does work — a prompt, a wake, a scheduled run —
    * and off only for summarising, where recalled notes would leak into the summary.
    */
-  async #session(conversation, workspace, profile, { skillPaths = [this.local.skills], recall = true, delivery = "" } = {}) {
+  // Connectors sit beside skills in the search path rather than in a mechanism of their
+  // own: a connector's SKILL.md is a skill, and this is the whole of its integration.
+  async #session(conversation, workspace, profile, { skillPaths = [this.local.skills, this.local.connectors], recall = true, delivery = "" } = {}) {
     await mkdir(workspace, { recursive: true });
     // $TMPDIR points inside the workspace, so scratch dies with the conversation instead
     // of piling up in the container. $HOME is the agent's shared session home, which is
