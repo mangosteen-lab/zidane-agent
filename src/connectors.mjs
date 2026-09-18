@@ -323,10 +323,14 @@ export class ConnectorStore {
    * Jira and Confluence are separate connectors for this reason rather than in spite of
    * it — they namespace their values instead of sharing one.
    */
-  async #claim(name, values) {
+  async #claim(name, values, ignore = []) {
+    // A rename has to ignore the record it is renaming *from* as well as the name it is
+    // renaming to — otherwise a connector collides with its own outgoing copy, which
+    // still holds every value it is about to take with it.
+    const mine = new Set([name, ...ignore]);
     const claims = new Map(await this.foreignClaims());
     for (const item of await this.list()) {
-      if (item.name === name) continue;
+      if (mine.has(item.name)) continue;
       for (const key of valueNames(item)) claims.set(key, `the ${item.name} connector`);
     }
     for (const key of values) {
@@ -357,6 +361,70 @@ export class ConnectorStore {
    * Secret values arrive from `config-maps/.env` at startup; ordinary ones live in the
    * records, so they are replayed from there on the way up.
    */
+  /**
+   * Reconcile the connectors the account shares with this agent.
+   *
+   * Only synced copies are ours to touch: a connector made here, or one promoted from a
+   * template on the agent itself, carries no `source_id` and is left alone. A copy whose
+   * source is no longer visible is removed outright — revoking visibility has to take
+   * the credential off the agent's disk, or revoking it means nothing.
+   *
+   * Reconciled by source id rather than by name, so renaming a connector on the account
+   * renames the copy instead of leaving a second one beside it.
+   */
+  async refreshAccount(incoming) {
+    const allowed = new Map(
+      incoming
+        .filter((raw) => typeof raw?.source_id === "string" && raw.source_id)
+        .map((raw) => [String(raw.source_id), raw]),
+    );
+    const seen = new Set();
+    let created = 0;
+    let updated = 0;
+    let removed = 0;
+    for (const item of await this.list()) {
+      if (!item.source_id) continue;
+      const raw = allowed.get(item.source_id);
+      if (!raw) {
+        await this.remove(item.name);
+        removed += 1;
+        continue;
+      }
+      seen.add(item.source_id);
+      const name = validConnectorName(raw.name);
+      const clash = await this.#read(name);
+      if (clash && clash.source_id !== item.source_id) {
+        throw new Error(`a connector named ${name} already exists`);
+      }
+      await this.#store(name, { ...raw, source_id: item.source_id }, item, [item.name]);
+      if (item.name !== name) await rm(this.#directory(item.name), { recursive: true, force: true });
+      updated += 1;
+    }
+    for (const [sourceId, raw] of allowed) {
+      if (seen.has(sourceId)) continue;
+      const name = validConnectorName(raw.name);
+      const clash = await this.#read(name);
+      if (clash && clash.source_id !== sourceId) {
+        throw new Error(`a connector named ${name} already exists`);
+      }
+      await this.#store(name, { ...raw, source_id: sourceId }, clash, []);
+      created += 1;
+    }
+    return { created, updated, removed };
+  }
+
+  /** Write one account copy, keeping the identity the account stamped into the file. */
+  async #store(name, raw, existing, ignore) {
+    const record = connectorRecord(existing, { ...raw, name });
+    await this.#claim(name, valueNames(record), ignore);
+    const content = validContent(raw.content);
+    // The account stamped its row id into the frontmatter, and that is the connector's
+    // identity: keeping it is what makes this a copy of that row rather than a new one.
+    const id = skillIdentity(content) || existing?.id || crypto.randomUUID();
+    await this.#write(name, id, record, content, { source: { scope: "account", id: raw.source_id } });
+    await this.#applyValues(record, raw.secret_entries);
+  }
+
   /** Every value name a connector owns, so a config map can be refused the same way. */
   async valueClaims() {
     const claims = new Map();
@@ -395,7 +463,7 @@ export class ConnectorStore {
       throw new Error("a connector with this name already exists");
     }
     const record = connectorRecord(current, input);
-    await this.#claim(name, valueNames(record));
+    await this.#claim(name, valueNames(record), [current.name]);
     const content = input.content === undefined ? current.content : validContent(input.content);
     await this.#write(name, current.id, record, content, input);
     if (name !== current.name) await rm(this.#directory(current.name), { recursive: true, force: true });

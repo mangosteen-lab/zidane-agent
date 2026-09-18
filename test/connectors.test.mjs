@@ -305,3 +305,70 @@ test("a connector with no health check is never due", () => {
   assert.equal(transitionOf("unconfigured", "unconfigured"), null);
   assert.equal(transitionOf("pass", "unconfigured"), null);
 });
+
+test("an account connector syncs down, renames in place, and leaves local ones alone", async () => {
+  const { root, connectors } = await workspace("zidane-connector-sync-");
+  try {
+    // One the agent made for itself. A sync must never sweep this.
+    await connectors.handle("connector.create", {
+      name: "local", content: SKILL, normal_values: { LOCAL_BASE: "https://local" }, secret_values: [],
+    });
+
+    const shared = (id, name, value) => ({
+      source_id: id,
+      name,
+      content: `---\nid: ${id}\nname: ${name}\ndescription: Shared.\n---\n# ${name}\n`,
+      title: name, description: "",
+      normal_values: { SHARED_SITE: value }, secret_values: ["SHARED_TOKEN"],
+      secret_entries: { SHARED_TOKEN: "shared-secret-value" },
+      verify: { http: { url: "${SHARED_SITE}/me" }, interval_minutes: 60 },
+    });
+
+    assert.deepEqual(
+      await connectors.refreshAccount([shared("acct-1", "shared", "https://one")]),
+      { created: 1, updated: 0, removed: 0 },
+    );
+    const copy = (await connectors.handle("connector.get", { connector_id: "shared" })).item;
+    // The account's row id travels in the file, so the copy *is* that row's connector.
+    assert.equal(copy.id, "acct-1");
+    assert.equal(process.env.SHARED_SITE, "https://one");
+    assert.equal(readSecretValue("SHARED_TOKEN"), "shared-secret-value");
+
+    // Renaming on the account renames the copy rather than leaving a second one.
+    assert.deepEqual(
+      await connectors.refreshAccount([shared("acct-1", "renamed", "https://two")]),
+      { created: 0, updated: 1, removed: 0 },
+    );
+    const names = (await connectors.list()).map((item) => item.name).sort();
+    assert.deepEqual(names, ["local", "renamed"]);
+    assert.equal(process.env.SHARED_SITE, "https://two");
+
+    // Revoking visibility takes the credential off the disk; the local one survives.
+    assert.deepEqual(await connectors.refreshAccount([]), { created: 0, updated: 0, removed: 1 });
+    assert.deepEqual((await connectors.list()).map((item) => item.name), ["local"]);
+    assert.equal(process.env.SHARED_TOKEN, undefined);
+    assert.equal(process.env.LOCAL_BASE, "https://local");
+  } finally {
+    for (const key of ["LOCAL_BASE", "SHARED_SITE", "SHARED_TOKEN"]) delete process.env[key];
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a connector can be renamed without colliding with its own outgoing copy", async () => {
+  const { root, connectors } = await workspace("zidane-connector-rename-");
+  try {
+    await connectors.handle("connector.create", {
+      name: "before", content: SKILL,
+      normal_values: { RENAME_SITE: "https://x" }, secret_values: ["RENAME_TOKEN"],
+    });
+    const renamed = (await connectors.handle("connector.update", {
+      connector_id: "before", name: "after", content: SKILL,
+      normal_values: { RENAME_SITE: "https://x" }, secret_values: ["RENAME_TOKEN"],
+    })).item;
+    assert.equal(renamed.name, "after");
+    assert.deepEqual((await connectors.list()).map((item) => item.name), ["after"]);
+  } finally {
+    for (const key of ["RENAME_SITE", "RENAME_TOKEN"]) delete process.env[key];
+    await rm(root, { recursive: true, force: true });
+  }
+});

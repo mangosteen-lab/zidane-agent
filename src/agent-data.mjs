@@ -451,6 +451,11 @@ export class AgentDataStore {
       knowledge: this.knowledge
         ? await this.knowledge.apply(Array.isArray(input.knowledge) ? input.knowledge : [])
         : { count: 0 },
+      // Reconciled like skills and config maps rather than replaced: a connector made
+      // on this agent is its own, and a sync must not sweep it.
+      connectors: this.connectors
+        ? await this.connectors.refreshAccount(Array.isArray(input.connectors) ? input.connectors : [])
+        : { created: 0, updated: 0, removed: 0 },
     };
   }
 

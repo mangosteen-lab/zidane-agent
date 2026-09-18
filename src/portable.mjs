@@ -3,10 +3,16 @@ import { cp, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promi
 import { relative, resolve } from "node:path";
 import * as tar from "tar";
 
-const ROOTS = ["agent.json", "SOUL.md", "skills", "memory", "knowledge", "config", "config-maps", "crontab"];
+const ROOTS = ["agent.json", "SOUL.md", "skills", "memory", "knowledge", "config", "config-maps", "connectors", "crontab"];
 // `config-maps` travels, but the secret values seeded into the environment from
 // `config-maps/.env` never do: a portable archive carries configuration, not credentials.
+//
+// A connector's folder travels for the same reason its config map does — the procedure
+// and the declaration are configuration. Its `status.json` does not: a health check
+// describes one machine's credential at one moment, and restoring it elsewhere would
+// assert a result nothing there has established.
 const EXCLUDED = new Set(["config-maps/.env"]);
+const EXCLUDED_NAMES = new Set(["status.json"]);
 const MAX_FILE_BYTES = 50 * 1024 * 1024;
 
 export async function exportAgent(local, filename) {
@@ -62,7 +68,7 @@ async function collect(path, root, files) {
   if (info.isDirectory()) { for (const name of await readdir(path)) await collect(resolve(path, name), root, files); return; }
   if (!info.isFile() || info.size > MAX_FILE_BYTES) throw new Error(`unsafe export entry: ${path}`);
   const relativePath = relative(root, path).split("\\").join("/");
-  if (EXCLUDED.has(relativePath)) return;
+  if (EXCLUDED.has(relativePath) || EXCLUDED_NAMES.has(relativePath.split("/").pop())) return;
   const data = await readFile(path);
   files.push({ path: relativePath, sha256: createHash("sha256").update(data).digest("hex"), size: info.size });
 }
