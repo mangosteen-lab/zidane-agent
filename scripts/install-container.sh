@@ -22,7 +22,7 @@
 # replaced, and the state directory is left exactly as it was.
 set -euo pipefail
 
-ZIDANE_AGENT_RELEASE=1.4.0
+ZIDANE_AGENT_RELEASE=1.5.0
 IMAGE_REPOSITORY=ghcr.io/mangosteen-lab/zidane-agent
 INSTALL_ROOT=${ZIDANE_INSTALL_ROOT:-/opt/mangosteen}
 CONTAINER_WORKDIR=/var/lib/zidane-agent
