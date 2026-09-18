@@ -3,6 +3,7 @@ import os from "node:os";
 import { resolve } from "node:path";
 import process from "node:process";
 import WebSocket from "ws";
+import { AccountSyncScheduler, syncEnabled } from "./account-sync.mjs";
 import { AgentDataStore } from "./agent-data.mjs";
 import { ConnectorStore, ConnectorWatcher } from "./connectors.mjs";
 import {
@@ -92,6 +93,9 @@ agentData.connectorValueClaims = () => connectors.valueClaims();
 // Secret values arrive from `config-maps/.env`; a connector's ordinary values live in
 // its record, so they are replayed into the environment on the way up.
 await connectors.apply();
+// The agent asks the account for its resources, rather than the control plane pushing
+// them on a schedule it would have to keep. See `account-sync.mjs`.
+const accountSync = new AccountSyncScheduler(send, logger);
 // A credential that stopped working is worth knowing about before somebody depends on
 // it. The check is declarative and costs no model call, so it runs outside capacity;
 // only a transition is reported, and `unconfigured` never is.
@@ -114,6 +118,7 @@ await knowledge.start();
 if ((process.env.ZIDANE_AGENT_CRON ?? "true") !== "false") cron.start();
 if ((process.env.ZIDANE_AGENT_FOLLOW_UPS ?? "true") !== "false") followUpScheduler.start();
 if ((process.env.ZIDANE_AGENT_CONNECTOR_CHECKS ?? "true") !== "false") connectorWatcher.start();
+if (syncEnabled()) accountSync.start();
 
 // The day's work is summarised into memory once the day is over. Checked on a slow
 // timer rather than scheduled for an hour: an agent that was asleep at midnight, or
@@ -217,6 +222,9 @@ async function handleMessage(message) {
       logger.log("info", "delivering scheduled-task reports held over the reconnect", { pending: cron.pending });
       cron.flush();
     }
+    // A reconnect is when an agent is most likely to be out of date: something may have
+    // changed while it was down, and nothing queued that for it.
+    if (syncEnabled()) accountSync.request("reconnect");
     return;
   }
   if (message.type === "ERROR") {
