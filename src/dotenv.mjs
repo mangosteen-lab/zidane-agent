@@ -18,21 +18,65 @@ export function envPath(local) {
   return resolve(local.configMaps, ENV_FILE);
 }
 
-/** Parse `KEY=value` lines. Quotes are stripped; anything malformed is skipped. */
+/** True when a quoted value is closed — the quote not cancelled by a backslash. */
+function closedQuote(raw, quote) {
+  if (raw.length < 2 || !raw.endsWith(quote)) return false;
+  let slashes = 0;
+  for (let at = raw.length - 2; at >= 0 && raw[at] === "\\"; at -= 1) slashes += 1;
+  return slashes % 2 === 0;
+}
+
+/**
+ * Turn the stored form back into the value.
+ *
+ * A double-quoted value is what `formatEnv` writes, and `JSON.parse` inverts it
+ * exactly — including the `\n` that an SSH key or a PEM certificate is full of. That
+ * used to be dropped: the quotes came off and the escape did not, so a multi-line
+ * secret arrived as one line with a literal backslash-n in it and failed much later,
+ * nowhere near the cause.
+ *
+ * A hand-written file is not JSON and must not be made to answer for that, so anything
+ * `JSON.parse` refuses — `"C:\path"`, or real newlines inside the quotes — falls back
+ * to the text between the quotes, unchanged. Single quotes never unescape, which is the
+ * convention everywhere else and the way to store a value containing backslashes.
+ */
+function decodeValue(raw, quote) {
+  if (!quote) return raw;
+  if (quote === '"') {
+    try {
+      const parsed = JSON.parse(raw);
+      if (typeof parsed === "string") return parsed;
+    } catch { /* hand-written, not something this wrote */ }
+  }
+  return raw.slice(1, closedQuote(raw, quote) ? -1 : undefined);
+}
+
+/**
+ * Parse `KEY=value` lines.
+ *
+ * A quoted value may span physical lines, so a key pasted into the file by hand keeps
+ * its newlines. Anything malformed is skipped rather than throwing: this file is seeded
+ * by deployments, and one bad line must not cost an agent every other value in it.
+ */
 export function parseEnv(text) {
   const values = {};
-  for (const raw of String(text ?? "").split("\n")) {
-    const line = raw.trim();
+  const lines = String(text ?? "").split("\n");
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index].trim();
     if (!line || line.startsWith("#")) continue;
     const separator = line.indexOf("=");
     if (separator < 1) continue;
     const key = line.slice(0, separator).trim().replace(/^export\s+/, "");
     if (!SAFE_ENV_KEY.test(key)) continue;
-    let value = line.slice(separator + 1).trim();
-    if (value.length > 1 && ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))) {
-      value = value.slice(1, -1);
+    let raw = line.slice(separator + 1).trim();
+    const quote = raw[0] === '"' || raw[0] === "'" ? raw[0] : "";
+    // Gather continuation lines until the quote closes. An unterminated one stops at the
+    // end of the file rather than swallowing the keys below it.
+    while (quote && !closedQuote(raw, quote) && index + 1 < lines.length) {
+      index += 1;
+      raw += `\n${lines[index]}`;
     }
-    values[key] = value;
+    values[key] = decodeValue(raw, quote);
   }
   return values;
 }
