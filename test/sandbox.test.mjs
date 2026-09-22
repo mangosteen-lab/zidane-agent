@@ -90,3 +90,38 @@ test("what a session installs outlives it; what it scribbles does not", async ()
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("the agent's own credentials do not travel into a session", async () => {
+  const root = await mkdtemp(resolve(tmpdir(), "zidane-sandbox-env-test-"));
+  try {
+    const paths = await prepareSandbox(resolve(root, "workspaces", "c1"), resolve(root, "home"));
+    const environment = sandboxEnvironment({
+      PATH: "/usr/bin",
+      // How the agent reaches its control plane. `ZIDANE_AGENT_API_KEY` is the
+      // registration key: with it and the server URL, anything can register another
+      // agent on the account and ask it for every secret the account shares. Pi hands
+      // the bash tool the whole of `process.env`, so this used to reach every command
+      // a session ran — an `echo` away from the model, and from a transcript.
+      ZIDANE_AGENT_API_KEY: "zidane_registration_key",
+      ZIDANE_AGENT_SERVER_URL: "wss://zidane.example.com",
+      ZIDANE_AGENT_WORKING_DIRECTORY: root,
+      // What a session is meant to have: its config maps' values, and the AI_AGENT_
+      // paths a skill is documented to read.
+      GH_TOKEN: "ghp_for_the_tools",
+      AI_AGENT_CONFIG_MAPS_FOLDER: resolve(root, "config-maps"),
+      AI_AGENT_KNOWLEDGE_FOLDER: resolve(root, "knowledge"),
+    }, paths);
+
+    assert.equal(Object.keys(environment).some((key) => key.startsWith("ZIDANE_")), false);
+    assert.equal(environment.ZIDANE_AGENT_API_KEY, undefined);
+    // Stripping the whole prefix can never take away a value somebody meant a tool to
+    // have, because a config map is refused a `ZIDANE_`-prefixed name in the first place.
+    assert.equal(environment.GH_TOKEN, "ghp_for_the_tools");
+    assert.equal(environment.AI_AGENT_CONFIG_MAPS_FOLDER, resolve(root, "config-maps"));
+    assert.equal(environment.AI_AGENT_KNOWLEDGE_FOLDER, resolve(root, "knowledge"));
+    assert.equal(environment.AI_AGENT_SESSION_WORKSPACE_DIR, paths.workspace);
+    assert.equal(environment.HOME, paths.home);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

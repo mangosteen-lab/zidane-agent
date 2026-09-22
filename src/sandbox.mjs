@@ -44,7 +44,41 @@ export async function prepareSandbox(workspace, home) {
 }
 
 /**
+ * The agent's own configuration, which is the agent's business and nobody else's.
+ *
+ * `process.env` is where the agent keeps how it reaches its control plane, and
+ * `ZIDANE_AGENT_API_KEY` is the registration key itself — the one that exchanges for
+ * session tokens, and the one thing in the container that is not merely a credential
+ * for some third-party service but the credential for the account. Pi hands the bash
+ * tool `{...process.env}`, so all of it was reaching every command a session runs: an
+ * `echo` away from a key that registers another agent on the account and then asks it
+ * for every secret the account shares.
+ *
+ * Stripping the whole prefix is safe *because* it is reserved: a config map may not
+ * define a `ZIDANE_`-prefixed value (`isRuntimeEnvironmentKey` refuses it), so this can
+ * never take away a value somebody meant a tool to have. What a session is supposed to
+ * find is `AI_AGENT_*` — the config-maps folder, the knowledge folder, its own
+ * workspace — and those stay exactly where they were.
+ *
+ * It is not a boundary, and must not be read as one. A session runs as the same user as
+ * the agent, so `/proc/<agent pid>/environ` is readable to it whatever this does, and
+ * clearing the variable in-process does not scrub that (the kernel keeps the exec-time
+ * copy). What this removes is the casual path: an `env` dump into a transcript, a
+ * script that logs its environment, a tool that reports what it was given. A real
+ * boundary needs sessions running as a different user.
+ */
+function withoutAgentConfig(environment) {
+  return Object.fromEntries(
+    Object.entries(environment).filter(([key]) => !key.startsWith("ZIDANE_")),
+  );
+}
+
+/**
  * The environment every command in this session sees.
+ *
+ * It starts from the agent's own environment with the agent's own configuration taken
+ * out — see `withoutAgentConfig`. What is left is what a session is meant to have: the
+ * values its config maps and connectors supply, and the `AI_AGENT_*` paths.
  *
  * `HOME` and the XDG directories point at the shared home, so a tool installed or
  * configured once is there for the next conversation: `gh auth login` writes
@@ -71,7 +105,7 @@ export function sandboxEnvironment(environment, { workspace, home, tmp }) {
   const local = resolve(home, ".local", "bin");
   const path = (environment.PATH ?? "").split(":").filter(Boolean);
   return {
-    ...environment,
+    ...withoutAgentConfig(environment),
     AI_AGENT_SESSION_WORKSPACE_DIR: workspace,
     HOME: home,
     PATH: [local, ...path.filter((entry) => entry !== local)].join(":"),
