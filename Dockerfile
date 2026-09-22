@@ -23,12 +23,21 @@ ENV AI_AGENT_CONFIG_MAPS_FOLDER=${ZIDANE_AGENT_WORKING_DIRECTORY}/config-maps \
 # no key to manage, both architectures covered, and security updates arrive with the
 # base image. They read GH_TOKEN/GITHUB_TOKEN and GITLAB_TOKEN from the environment,
 # which is where a config map's secret values already land.
+# `default-jdk-headless` is OpenJDK 21 on Ubuntu 24.04, and the metapackage rather than
+# `openjdk-21-jdk-headless` because it brings `/usr/lib/jvm/default-java` with it — one
+# JAVA_HOME that is right on both architectures, which an arch-specific path is not.
+# Headless: a build tool needs `javac` and `jar`, never a toolkit for drawing windows.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      bash ca-certificates curl fd-find gh git git-lfs glab jq openssh-client \
-      python3 python3-venv ripgrep tini unzip xz-utils \
+      bash ca-certificates curl default-jdk-headless fd-find gh git git-lfs glab jq \
+      openssh-client python3 python3-venv ripgrep tini unzip xz-utils \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
+
+# Maven, Gradle and anything else that shells out to a JDK look here first, and a session
+# cannot set it for them: the environment a tool runs in comes from the image and the
+# config maps, and `JAVA_HOME` is neither a secret nor something to repeat per agent.
+ENV JAVA_HOME=/usr/lib/jvm/default-java
 
 # The system git config, which is the layer everything else overrides.
 #

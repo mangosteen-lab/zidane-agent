@@ -53,6 +53,7 @@ curl  jq  ripgrep (rg)        fetching and reading
 fd-find (fdfind)  unzip  xz   finding and unpacking
 python3  python3-venv         a venv inside the workspace; there is no pip on the system
 node  npm                     Node 22
+java  javac  jar  jshell      OpenJDK 21 (headless), with JAVA_HOME set
 openssh-client  ca-certificates  bash  tini
 ```
 
@@ -304,8 +305,8 @@ removes the image when nothing else uses it.
 
 ### Building the image yourself
 
-The container uses Ubuntu 24.04, installs Node.js 22 and common coding tools, runs as the
-unprivileged `zidane` user, and persists `/var/lib/zidane-agent`:
+The container uses Ubuntu 24.04, installs Node.js 22, OpenJDK 21 and common coding tools,
+runs as the unprivileged `zidane` user, and persists `/var/lib/zidane-agent`:
 
 ```bash
 docker build -t zidane-agent .
