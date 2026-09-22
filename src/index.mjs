@@ -96,6 +96,12 @@ await connectors.apply();
 // The agent asks the account for its resources, rather than the control plane pushing
 // them on a schedule it would have to keep. See `account-sync.mjs`.
 const accountSync = new AccountSyncScheduler(send, logger);
+// An edit to a skill the account owns asks for a sync shortly after, which is how the
+// edit reaches the row it came from. The refresh that answers carries it up; see
+// `#refreshAccountSkills`.
+agentData.onAccountSkillEdited = () => {
+  if (syncEnabled()) accountSync.nudge("skill-edited");
+};
 // A credential that stopped working is worth knowing about before somebody depends on
 // it. The check is declarative and costs no model call, so it runs outside capacity;
 // only a transition is reported, and `unconfigured` never is.
@@ -505,7 +511,7 @@ async function connect() {
       capabilities: {
         pi_sdk: true,
         parallel_sessions: config.capacity,
-        agent_storage: { version: 7, resources: ["skills", "config_maps", "connectors", "secrets", "llm_profiles", "crontab", "follow_ups"] },
+        agent_storage: { version: 8, resources: ["skills", "config_maps", "connectors", "secrets", "llm_profiles", "crontab", "follow_ups"] },
         providers: modelCatalog.map((provider) => provider.id),
         model_catalog: modelCatalog,
       },

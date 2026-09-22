@@ -30,14 +30,24 @@ export function syncEnabled(environment = process.env) {
   return (environment.ZIDANE_AGENT_ACCOUNT_SYNC ?? "true") !== "false";
 }
 
+/**
+ * How long an edit waits before the agent asks for a sync.
+ *
+ * Long enough that saving a skill three times in a row is one request, short enough
+ * that an edit reaches the account while the person who made it is still watching.
+ */
+export const NUDGE_MS = 5_000;
+
 export class AccountSyncScheduler {
   #timer = null;
+  #nudge = null;
   #last = 0;
 
-  constructor(emit, logger, { minutes = syncMinutes(), now = Date.now } = {}) {
+  constructor(emit, logger, { minutes = syncMinutes(), nudgeMs = NUDGE_MS, now = Date.now } = {}) {
     this.emit = emit;
     this.logger = logger;
     this.intervalMs = minutes * 60_000;
+    this.nudgeMs = nudgeMs;
     this.now = now;
   }
 
@@ -52,6 +62,26 @@ export class AccountSyncScheduler {
   stop() {
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = null;
+    if (this.#nudge) clearTimeout(this.#nudge);
+    this.#nudge = null;
+  }
+
+  /**
+   * Ask shortly, because something here changed.
+   *
+   * An edit to a skill the account owns is the one case where waiting for the timer is
+   * plainly wrong: the copy is out of step with the row from the moment it is saved,
+   * and every hour it waits is another hour in which somebody edits the row too and
+   * turns a clean hand-over into a conflict. Coalesced, so a burst of saves is one ask.
+   */
+  nudge(reason = "local-change") {
+    if (this.#nudge) return false;
+    this.#nudge = setTimeout(() => {
+      this.#nudge = null;
+      this.request(reason);
+    }, this.nudgeMs);
+    this.#nudge.unref?.();
+    return true;
   }
 
   /**

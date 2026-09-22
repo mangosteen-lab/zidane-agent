@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { AccountSyncScheduler, DEFAULT_MINUTES, MIN_MINUTES, syncEnabled, syncMinutes } from "../src/account-sync.mjs";
+import { AccountSyncScheduler, DEFAULT_MINUTES, MIN_MINUTES, NUDGE_MS, syncEnabled, syncMinutes } from "../src/account-sync.mjs";
 
 test("the interval is read from the environment and kept sane", () => {
   assert.equal(syncMinutes({}), DEFAULT_MINUTES);
@@ -58,4 +58,27 @@ test("a stopped scheduler asks nothing", () => {
   scheduler.stop();
   scheduler.stop();
   assert.deepEqual(sent, []);
+});
+
+test("an edit here asks for a sync shortly after, and a burst of them asks once", async () => {
+  const sent = [];
+  const scheduler = new AccountSyncScheduler((type, body) => sent.push({ type, body }), null, { minutes: 360, nudgeMs: 20 });
+
+  // Saving three times in a row is one ask, not three: the point is that the edit does
+  // not wait six hours for the timer, not that every keystroke reaches the server.
+  assert.ok(NUDGE_MS >= 1_000, "the default window coalesces a burst of saves");
+  assert.equal(scheduler.nudge("skill-edited"), true);
+  assert.equal(scheduler.nudge("skill-edited"), false);
+  assert.equal(scheduler.nudge("skill-edited"), false);
+  assert.equal(sent.length, 0, "the ask is deferred, not immediate");
+
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].body.reason, "skill-edited");
+
+  // The window is over, so a later edit asks again.
+  assert.equal(scheduler.nudge("skill-edited"), true);
+  scheduler.stop();
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(sent.length, 1, "a stopped scheduler asks nothing, pending nudge included");
 });

@@ -40,7 +40,7 @@ test("agent-owned skills and config maps support local CRUD and account imports"
       skills: [{ source_id: "account-skill-1", name: "Incident response", content: "# Incident response\n" }],
       configs: [],
     });
-    assert.deepEqual(firstSync.skills, { created: 1, updated: 0, removed: 0 });
+    assert.partialDeepStrictEqual(firstSync.skills, { created: 1, updated: 0, removed: 0, pushed: 0, conflicts: 0 });
     const importedSkills = (await store.handle("skill.list")).items.filter((item) => item.source.scope === "account");
     assert.equal(importedSkills[0].source.scope, "account");
     assert.equal(importedSkills[0].source.id, "account-skill-1");
@@ -104,13 +104,13 @@ test("agent-owned skills and config maps support local CRUD and account imports"
       skills: [{ source_id: "account-skill-1", name: "Incident response", content: "# Incident response v3\n" }],
       configs: [{ source_id: "account-config-1", name: "ACCOUNT_DEFAULTS", title: "Account defaults", normal_values: { IMPORTED_SETTING: "refreshed" } }],
     });
-    assert.deepEqual(refreshed.skills, { created: 0, updated: 1, removed: 0 });
+    assert.partialDeepStrictEqual(refreshed.skills, { created: 0, updated: 1, removed: 0 });
     assert.deepEqual(refreshed.configs, { created: 0, updated: 1, removed: 0 });
     assert.match((await store.handle("skill.get", { skill_id: importedSkills[0].skill_id })).item.content, /v3/);
     assert.equal(process.env.IMPORTED_SETTING, "refreshed");
 
     const revoked = await store.handle("account.refresh", { skills: [], configs: [] });
-    assert.deepEqual(revoked.skills, { created: 0, updated: 0, removed: 1 });
+    assert.partialDeepStrictEqual(revoked.skills, { created: 0, updated: 0, removed: 1 });
     assert.deepEqual(revoked.configs, { created: 0, updated: 0, removed: 1 });
     // The manual skill written outside Zidane is never touched by an account sync.
     const survivingSkills = (await store.handle("skill.list")).items;
@@ -197,10 +197,10 @@ test("the same skill is recognisable between the agent and the account", async (
       skills: [{ source_id: "shared-identity-1", name: "Triage", content: "# Triage v3\n" }],
       configs: [],
     });
-    assert.deepEqual(sync.skills, { created: 0, updated: 1, removed: 0 });
+    assert.partialDeepStrictEqual(sync.skills, { created: 0, updated: 1, removed: 0 });
     const adopted = (await store.handle("skill.list")).items.filter((item) => item.skill_id === "shared-identity-1");
     assert.equal(adopted.length, 1);
-    assert.deepEqual(adopted[0].source, { scope: "account", id: "shared-identity-1" });
+    assert.partialDeepStrictEqual(adopted[0].source, { scope: "account", id: "shared-identity-1", state: "synced" });
     const stored = (await store.handle("skill.get", { skill_id: "shared-identity-1" })).item;
     assert.match(stored.content, /# Triage v3/);
     assert.equal(skillIdentity(stored.content), "shared-identity-1");
@@ -216,7 +216,7 @@ test("the same skill is recognisable between the agent and the account", async (
       source_id: "account-row-9",
     })).item;
     assert.equal(bound.skill_id, "account-row-9");
-    assert.deepEqual(bound.source, { scope: "account", id: "account-row-9" });
+    assert.partialDeepStrictEqual(bound.source, { scope: "account", id: "account-row-9" });
     assert.equal(skillIdentity(bound.content), "account-row-9");
     assert.match(bound.content, /# Runbook/);
     const afterPublish = await store.handle("account.refresh", {
@@ -226,7 +226,9 @@ test("the same skill is recognisable between the agent and the account", async (
       ],
       configs: [],
     });
-    assert.deepEqual(afterPublish.skills, { created: 0, updated: 2, removed: 0 });
+    // Triage is sent back exactly as it sits on disk, so the sync records its version
+    // and writes nothing: an unchanged skill is no longer rewritten every six hours.
+    assert.partialDeepStrictEqual(afterPublish.skills, { created: 0, updated: 1, unchanged: 1, removed: 0 });
     assert.equal((await store.handle("skill.list")).items.filter((item) => item.name === "Runbook").length, 1);
 
     // A hand-placed skill is still nobody's copy: a sync leaves it exactly where it is.
@@ -279,6 +281,140 @@ test("a session can save what it worked out as a skill a later one will load", a
     assert.equal(listed.length, 1);
     assert.equal(listed[0].source.scope, "agent");
     assert.match((await store.handle("skill.get", { skill_id: listed[0].skill_id })).item.content, /Smoke test/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an edit made on the agent goes up instead of being overwritten by the next sync", async () => {
+  const root = await mkdtemp(resolve(tmpdir(), "zidane-skill-pushback-test-"));
+  try {
+    const local = await initialise({ name: "test", version: "1", description: "", capacity: 1, workingDirectory: root });
+    const store = new AgentDataStore(local);
+    const account = (content, version) => ({
+      skills: [{ source_id: "account-skill-1", name: "Incident response", content, version }],
+      configs: [],
+    });
+    let edited = 0;
+    store.onAccountSkillEdited = () => { edited += 1; };
+
+    await store.handle("account.refresh", account("# Incident response\n", 4));
+    const imported = (await store.handle("skill.list")).items.find((item) => item.source.scope === "account");
+    assert.equal(imported.source.state, "synced");
+
+    // The same sync again writes nothing at all: an unchanged skill is left alone, so
+    // nothing watching the directory sees a file that was never touched change.
+    const untouched = await store.handle("account.refresh", account("# Incident response\n", 4));
+    assert.partialDeepStrictEqual(untouched.skills, { created: 0, updated: 0, unchanged: 1, pushed: 0, conflicts: 0 });
+
+    // Somebody improves the copy on the agent.
+    await store.handle("skill.update", {
+      skill_id: imported.skill_id,
+      name: "Incident response",
+      content: "# Incident response\n\nPage the on-call engineer first.\n",
+    });
+    assert.equal(edited, 1, "a local edit to an imported skill asks for a sync");
+    assert.equal((await store.handle("skill.list")).items.find((item) => item.skill_id === imported.skill_id).source.state, "modified");
+
+    // The account has not moved, so the edit is the newer of the two: it is handed up
+    // and the file stays exactly as it was written here.
+    const handedUp = await store.handle("account.refresh", account("# Incident response\n", 4));
+    assert.partialDeepStrictEqual(handedUp.skills, { created: 0, updated: 0, unchanged: 0, pushed: 1, conflicts: 0 });
+    assert.equal(handedUp.skills.push[0].source_id, "account-skill-1");
+    assert.equal(handedUp.skills.push[0].base_version, 4);
+    assert.match(handedUp.skills.push[0].content, /Page the on-call engineer first/);
+    assert.match((await store.handle("skill.get", { skill_id: imported.skill_id })).item.content, /Page the on-call engineer first/);
+
+    // The server adopted it, so the settling round brings the agent's own text back
+    // under a new version. That is convergence, not a change — and not a conflict.
+    const settled = await store.handle("account.refresh", account(
+      withSkillIdentity("# Incident response\n\nPage the on-call engineer first.\n", "account-skill-1"),
+      5,
+    ));
+    assert.partialDeepStrictEqual(settled.skills, { created: 0, updated: 0, unchanged: 1, pushed: 0, conflicts: 0 });
+    assert.equal((await store.handle("skill.list")).items.find((item) => item.skill_id === imported.skill_id).source.state, "synced");
+
+    // Now both sides move. Neither is thrown away: the local file stands, and the copy
+    // says it is in conflict rather than pretending one of the two won.
+    await store.handle("skill.update", {
+      skill_id: imported.skill_id,
+      name: "Incident response",
+      content: "# Incident response\n\nPage the on-call engineer, then open a room.\n",
+    });
+    const clash = await store.handle("account.refresh", account("# Incident response\n\nRewritten in the console.\n", 9));
+    assert.partialDeepStrictEqual(clash.skills, { created: 0, updated: 0, unchanged: 0, pushed: 0, conflicts: 1 });
+    const held = (await store.handle("skill.list")).items.find((item) => item.skill_id === imported.skill_id);
+    assert.equal(held.source.state, "conflict");
+    assert.equal(held.source.conflict, 9);
+    assert.match((await store.handle("skill.get", { skill_id: imported.skill_id })).item.content, /then open a room/);
+
+    // Revoking visibility still takes the skill off the disk, edit and all: the account
+    // has said this agent may not have it, and a private fork is not what that means.
+    assert.partialDeepStrictEqual((await store.handle("account.refresh", { skills: [], configs: [] })).skills, { removed: 1 });
+    assert.equal((await store.handle("skill.list")).items.length, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a copy synced before two-way sync is never mistaken for an edited one", async () => {
+  const root = await mkdtemp(resolve(tmpdir(), "zidane-skill-legacy-test-"));
+  try {
+    const local = await initialise({ name: "test", version: "1", description: "", capacity: 1, workingDirectory: root });
+    const store = new AgentDataStore(local);
+
+    // What an older agent left behind: a sidecar with a source but no base to compare
+    // against. It cannot prove an edit, so it does not claim one and the account wins.
+    const directory = resolve(local.skills, "incident-response");
+    await mkdir(directory, { recursive: true });
+    await writeFile(resolve(directory, "SKILL.md"), withSkillIdentity("# Edited locally, long ago\n", "account-skill-1"));
+    await writeFile(resolve(directory, ".zidane.json"), JSON.stringify({
+      id: "account-skill-1",
+      name: "Incident response",
+      source: { scope: "account", id: "account-skill-1" },
+      created_at: Date.now(),
+      updated_at: Date.now(),
+    }));
+
+    const applied = await store.handle("account.refresh", {
+      skills: [{ source_id: "account-skill-1", name: "Incident response", content: "# From the account\n", version: 3 }],
+      configs: [],
+    });
+    assert.partialDeepStrictEqual(applied.skills, { created: 0, updated: 1, pushed: 0, conflicts: 0 });
+    assert.match((await store.handle("skill.get", { skill_id: "account-skill-1" })).item.content, /From the account/);
+    // From here on it has a base, so the next edit is recognisable as one.
+    assert.equal((await store.handle("skill.list")).items[0].source.state, "synced");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a copy matched only by the identity in its file is linked before it is trusted", async () => {
+  const root = await mkdtemp(resolve(tmpdir(), "zidane-skill-identity-link-test-"));
+  try {
+    const local = await initialise({ name: "test", version: "1", description: "", capacity: 1, workingDirectory: root });
+    const store = new AgentDataStore(local);
+
+    // Written here and carrying an id the account turns out to use — a restored export,
+    // or a copy promoted from this agent by an older release. It has never been told a
+    // version, so it cannot claim an edit: the account's content wins and it is linked.
+    const written = (await store.handle("skill.create", {
+      name: "Runbook",
+      content: "---\nid: account-row-7\nname: runbook\ndescription: Mine\n---\n\n# Written here\n",
+    })).item;
+    assert.equal(written.source.scope, "agent");
+
+    const applied = await store.handle("account.refresh", {
+      skills: [{ source_id: "account-row-7", name: "Runbook", content: "# From the account\n", version: 5 }],
+      configs: [],
+    });
+    assert.partialDeepStrictEqual(applied.skills, { created: 0, updated: 1, pushed: 0, conflicts: 0 });
+    const linked = (await store.handle("skill.list")).items.find((item) => item.skill_id === "account-row-7");
+    assert.equal(linked.source.scope, "account");
+    assert.equal(linked.source.id, "account-row-7");
+    assert.equal(linked.source.state, "synced");
+    assert.equal(linked.source.version, 5);
+    assert.equal((await store.handle("skill.list")).items.length, 1, "linked in place, not twinned");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

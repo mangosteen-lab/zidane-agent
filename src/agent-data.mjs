@@ -36,6 +36,18 @@ export function skillIdentity(content) {
   return "";
 }
 
+/**
+ * The fingerprint of a skill's content, as the sidecar records it.
+ *
+ * `source.base` is the content the agent and the account last agreed on. Comparing the
+ * file against it is what tells an edit made here from a copy that is merely out of
+ * date, and that distinction is the whole of two-way sync: without it every refresh
+ * looks like a change and the newest writer wins by accident.
+ */
+export function contentHash(content) {
+  return createHash("sha256").update(String(content ?? "")).digest("hex");
+}
+
 /** The same content, declaring `id`. Whatever it declared before does not survive. */
 export function withSkillIdentity(content, id) {
   const text = String(content ?? "");
@@ -168,6 +180,33 @@ export class AgentDataStore {
     await atomicJson(resolve(directory, ".zidane.json"), metadata);
   }
 
+  /**
+   * Record what a sync settled, without touching the file the agent is reading.
+   *
+   * The reconciler has to write down a version or a conflict for copies it deliberately
+   * did **not** rewrite. Going through `#writeSkill` would rewrite `SKILL.md` with the
+   * text already in it, which changes its mtime for no reason and makes an untouched
+   * skill look freshly edited to anything watching the directory.
+   */
+  async #writeSkillSidecar(entry, sourceId, { name, version, base, conflict = 0 }) {
+    const current = entry.source ?? {};
+    if (
+      entry.name === name
+      && accountVersion(current.version) === version
+      && (current.base ?? "") === base
+      && Number(current.conflict ?? 0) === conflict
+    ) return;
+    const source = { scope: "account", id: sourceId, version, base };
+    if (conflict) source.conflict = conflict;
+    await atomicJson(resolve(entry.directory, ".zidane.json"), {
+      id: sourceId,
+      name,
+      source,
+      created_at: entry.created_at,
+      updated_at: entry.updated_at,
+    });
+  }
+
   async #skillEntries() {
     await mkdir(this.local.skills, { recursive: true });
     return discoverSkills(this.local.skills);
@@ -217,6 +256,9 @@ export class AgentDataStore {
     };
     const body = withSkillIdentity(content, id);
     await this.#writeSkill(entry.directory, metadata, body);
+    // An edit to an imported skill is the account's business: say so, so the agent can
+    // ask for a sync in a moment rather than sitting on it until the next one is due.
+    if (entry.source?.scope === "account" && body !== entry.content) this.onAccountSkillEdited?.(entry.source.id);
     return publicSkill({ ...metadata, content: body });
   }
 
@@ -238,7 +280,16 @@ export class AgentDataStore {
     const metadata = {
       id: sourceId,
       name: entry.name,
-      source: { scope: "account", id: sourceId },
+      source: {
+        scope: "account",
+        id: sourceId,
+        // What was just published *is* what the account holds, so the copy starts life
+        // agreeing with it. Without this the next refresh would see no base, read the
+        // copy as untouched, and the two would still agree — but a later local edit
+        // would be invisible until something else established one.
+        version: accountVersion(input.version),
+        base: contentHash(content),
+      },
       created_at: entry.created_at,
       updated_at: Date.now(),
     };
@@ -259,11 +310,37 @@ export class AgentDataStore {
 
   
 
+  /**
+   * Reconcile the account's skills with the copies on disk — in both directions.
+   *
+   * The account used to win outright: every refresh rewrote every imported copy, so an
+   * edit made here survived only until the next sync, six hours away at most. Now the
+   * sidecar remembers what the two levels last agreed on — `source.base`, the content
+   * fingerprint, and `source.version`, the row version it came from — which is enough
+   * to tell a stale copy from an edited one:
+   *
+   * - identical on both sides   → nothing but the version is recorded
+   * - untouched here            → the account's copy is written, as it always was
+   * - edited here, row unmoved  → the edit is handed **up** in `push`, and the file stands
+   * - edited here, row moved too → neither side is discarded: the file stands and the
+   *                                copy is marked `conflict` for a person to settle
+   *
+   * A copy written before any of this carries no `base` and reads as untouched, which
+   * is the old behaviour and the safe one: nothing claims an edit it cannot prove.
+   *
+   * **Content is what travels; the name follows the account.** A row's name is account
+   * state — unique across it, and the thing `$name` resolves — so a rename comes down
+   * and is never pushed up, and a push carries no name at all. That keeps this path
+   * incapable of colliding two account skills into one.
+   */
   async #refreshAccountSkills(incoming) {
     const allowed = new Map(incoming.map((raw) => [validId(raw.source_id, "account skill"), raw]));
     let created = 0;
     let updated = 0;
     let removed = 0;
+    let unchanged = 0;
+    let conflicts = 0;
+    const push = [];
     await mkdir(this.local.skills, { recursive: true });
     const entries = await this.#skillEntries();
 
@@ -280,7 +357,9 @@ export class AgentDataStore {
     }
 
     // A copy whose source is no longer shared with this agent goes, which is what makes
-    // revoking visibility take the skill off the disk.
+    // revoking visibility take the skill off the disk. An edit made here goes with it:
+    // the account has said this agent may not have the skill, and keeping a private
+    // fork of something withdrawn is not what revoking means.
     for (const entry of entries) {
       if (entry.source?.scope !== "account" || allowed.has(entry.source.id)) continue;
       await rm(entry.directory, { recursive: true, force: true });
@@ -291,7 +370,41 @@ export class AgentDataStore {
     for (const [sourceId, raw] of allowed) {
       const entry = held.get(sourceId);
       const name = validName(raw.name, "skill");
+      const content = withSkillIdentity(validContent(raw.content), sourceId);
+      const version = accountVersion(raw.version);
       const timestamp = Date.now();
+
+      // Only a copy already bound to *this* row can be reasoned about. One matched by
+      // the identity in its file — a restored export, a copy promoted from here — has
+      // never been told what version it holds, so it takes the account's content and
+      // becomes linked, which is what the sync did for everything before this.
+      const linked = entry?.source?.scope === "account" && entry.source.id === sourceId;
+
+      if (entry && linked && entry.content === content) {
+        // Converged — including the sync right after a push, where what comes back is
+        // the agent's own text under a new version. Recording it is what ends the
+        // exchange; treating it as a change would restart it forever.
+        await this.#writeSkillSidecar(entry, sourceId, { name, version, base: contentHash(content) });
+        unchanged += 1;
+        continue;
+      }
+
+      if (entry && linked && entry.source.base && contentHash(entry.content) !== entry.source.base) {
+        if (accountVersion(entry.source.version) === version) {
+          // The row has not moved since this copy came down, so the edit is simply the
+          // newer of the two. It goes up; the file is left exactly as it is.
+          push.push({ source_id: sourceId, content: entry.content, base_version: version });
+          await this.#writeSkillSidecar(entry, sourceId, { name, version, base: entry.source.base });
+          continue;
+        }
+        // Both sides moved. Overwriting would lose work somebody did deliberately, and
+        // pushing would lose work somebody else did just as deliberately, so this does
+        // neither and says so.
+        await this.#writeSkillSidecar(entry, sourceId, { name, version: accountVersion(entry.source.version), base: entry.source.base, conflict: version });
+        conflicts += 1;
+        continue;
+      }
+
       await this.#writeSkill(
         entry ? entry.directory : await this.#skillDirectory(name),
         {
@@ -299,16 +412,19 @@ export class AgentDataStore {
           // levels never need a mapping to agree on what is the same skill.
           id: sourceId,
           name,
-          source: { scope: "account", id: sourceId },
+          source: { scope: "account", id: sourceId, version, base: contentHash(content) },
           created_at: entry ? entry.created_at : timestamp,
           updated_at: timestamp,
         },
-        withSkillIdentity(validContent(raw.content), sourceId),
+        content,
       );
       if (entry) updated += 1;
       else created += 1;
     }
-    return { created, updated, removed };
+    // `push` is read by the control plane from this very reply — the agent asks, the
+    // server answers, and what the agent has to say travels back the same way. No frame
+    // and no scheduler were added for it.
+    return { created, updated, removed, unchanged, conflicts, pushed: push.length, push };
   }
 
   /** Config maps used to live under `config/agent-config-maps/`. */
@@ -629,6 +745,28 @@ export class AgentDataStore {
   }
 }
 
+/**
+ * What an imported copy knows about the row it came from.
+ *
+ * `version` and `base` are written by the last sync that agreed with the account:
+ * the row version that arrived, and the fingerprint of the content written for it.
+ * `state` is derived from them on every read rather than stored, so it cannot go
+ * stale — `modified` is a local edit waiting to go up, `conflict` is one the account
+ * moved under, and a copy from before any of this has no `base` and reads as `synced`,
+ * which is the old behaviour: nothing claims an edit it cannot prove.
+ */
+function accountSource(stored, content) {
+  const version = Number(stored.version);
+  const base = typeof stored.base === "string" && /^[0-9a-f]{64}$/.test(stored.base) ? stored.base : "";
+  const conflict = Number(stored.conflict);
+  const source = { scope: "account", id: String(stored.id) };
+  if (Number.isInteger(version) && version > 0) source.version = version;
+  if (base) source.base = base;
+  if (Number.isInteger(conflict) && conflict > 0) source.conflict = conflict;
+  source.state = source.conflict ? "conflict" : base && contentHash(content) !== base ? "modified" : "synced";
+  return source;
+}
+
 export async function discoverSkills(root) {
   const found = [];
   async function walk(directory, depth) {
@@ -653,7 +791,7 @@ export async function discoverSkills(root) {
           skill_id: identity || `manual-${createHash("sha256").update(relativePath).digest("hex").slice(0, 16)}`,
           name: validStoredName(metadata?.name) ?? inferredSkillName(content, entry.name),
           source: managed && metadata.source?.scope === "account" && SAFE_ID.test(String(metadata.source.id ?? ""))
-            ? { scope: "account", id: String(metadata.source.id) }
+            ? accountSource(metadata.source, content)
             : { scope: managed ? "agent" : "manual" },
           content,
           created_at: Number(metadata?.created_at) || details.birthtimeMs || details.mtimeMs,
@@ -669,6 +807,12 @@ export async function discoverSkills(root) {
   }
   await walk(root, 0);
   return found.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+/** A row version as the account states it; anything unusable reads as the first. */
+function accountVersion(value) {
+  const version = Number(value);
+  return Number.isInteger(version) && version > 0 ? version : 1;
 }
 
 /** A skill's own one-line summary, from its frontmatter. */
