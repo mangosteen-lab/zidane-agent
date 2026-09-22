@@ -98,7 +98,7 @@ export function redact(text, secrets = []) {
     // `Authorization: ` and stopping at the first space redacts the word `Bearer` and
     // leaves the credential standing in the clear.
     .replace(
-      /((?:api[-_]?key|authorization|secret|token|password)["']?\s*[:=]\s*["']?)(?:(?:Bearer|Basic|Token)\s+)?[^\s"',;]+/gi,
+      /((?:api[\s_-]?key|authorization|secret|token|password)["']?\s*[:=]\s*["']?)(?:(?:Bearer|Basic|Token)\s+)?[^\s"',;]+/gi,
       "$1[redacted]",
     )
     .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 [redacted]")

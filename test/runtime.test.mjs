@@ -43,6 +43,17 @@ test("a conversation runs one prompt at a time, and capacity bounds the rest", a
     runtime.prompt({ delivery_id: "d5", conversation_id: "thread-a", text: "five" });
     assert.equal(runtime.active, 1);
     await Promise.allSettled([...runtime.activeTasks]);
+
+    // Every run that failed said so, and said what kind of failure it was. A prompt
+    // that reaches nobody is the whole problem: the control plane records a reply only
+    // when there is one, so an unreported error is an agent that just goes quiet.
+    const done = emitted.filter(([type]) => type === "PROMPT_DONE");
+    assert.ok(done.length >= 3, "each admitted prompt reports its own end");
+    for (const [, body] of done) {
+      assert.equal(body.status, "error");
+      assert.ok(body.reason, "a failure is named, not just reported");
+      assert.ok(body.error, "and it carries what went wrong");
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }

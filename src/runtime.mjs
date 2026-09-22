@@ -6,6 +6,7 @@ import { expandCommand, looksLikeCommand } from "./commands.mjs";
 import { readSecretValue, resolveLlmProfile } from "./config.mjs";
 import { contextTools } from "./context-tools.mjs";
 import { recallExtension, recallGuidance } from "./recall.mjs";
+import { describeFailure } from "./prompt-failure.mjs";
 import { prepareSandbox, sandboxTools } from "./sandbox.mjs";
 
 const COMPACT_PROMPT = `Summarise this entire conversation as a durable note for your future self.
@@ -54,7 +55,7 @@ export class PiRuntime {
     const task = this.#run(delivery, entry)
       .catch((error) => this.emit("PROMPT_DONE", {
         delivery_id: delivery.delivery_id, conversation_id: delivery.conversation_id,
-        status: "error", error: String(error),
+        status: "error", ...describeFailure(error),
       }))
       .finally(() => {
         this.#active.delete(delivery.delivery_id);
@@ -302,8 +303,13 @@ export class PiRuntime {
       this.emit("PROMPT_DONE", { delivery_id: delivery.delivery_id, conversation_id: delivery.conversation_id, status: entry.cancelled ? "cancelled" : "completed", final_text: responseText.slice(0, 100_000) });
       this.logger?.log("info", "prompt finished", { delivery_id: delivery.delivery_id, conversation_id: delivery.conversation_id, status: entry.cancelled ? "cancelled" : "completed" });
     } catch (error) {
-      this.emit("PROMPT_DONE", { delivery_id: delivery.delivery_id, conversation_id: delivery.conversation_id, status: "error", error: String(error) });
-      this.logger?.log("error", "prompt failed", { delivery_id: delivery.delivery_id, conversation_id: delivery.conversation_id, error: String(error) });
+      // What failed matters more than that it failed: a provider rate limit is waited
+      // out, a credential is fixed, and the person in the chat can only tell the two
+      // apart if the agent says which it was. The message is the provider's own, with
+      // anything key-shaped taken out of it.
+      const failure = describeFailure(error);
+      this.emit("PROMPT_DONE", { delivery_id: delivery.delivery_id, conversation_id: delivery.conversation_id, status: "error", ...failure });
+      this.logger?.log("error", "prompt failed", { delivery_id: delivery.delivery_id, conversation_id: delivery.conversation_id, reason: failure.reason, error: failure.error });
     }
   }
 }
