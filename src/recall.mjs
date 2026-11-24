@@ -237,3 +237,33 @@ function clip(text) {
   const value = String(text ?? "").trim();
   return value.length > MAX_ENTRY ? `${value.slice(0, MAX_ENTRY)}…` : value;
 }
+
+/**
+ * How a session gets a repository, added beside `recallGuidance`.
+ *
+ * Only advice: a literal `git clone` takes the same shared mirror through the wrapper.
+ * What it adds is the tool — one call that also checks out a ref and reuses a clone the
+ * conversation already has — and the reason not to share one working folder.
+ */
+export function repositoryGuidance(tools = [], cached = true) {
+  if (tools.length && !tools.includes("checkout_repo")) return "";
+  return [
+    "",
+    "## Repositories",
+    "",
+    "- To get a git repository, call `checkout_repo` with its URL (and a branch, tag or commit "
+    + "if one matters) rather than cloning by hand. It clones into this conversation's own "
+    + "workspace and calling it again reuses that clone.",
+    cached
+      ? "- Clones come from a mirror shared by every session on this agent, so even a large "
+        + "repository arrives in seconds after the first time, and `git clone` in bash does the "
+        + "same. Each clone is still this conversation's alone: edit, branch and commit freely; "
+        + "`origin` is the real repository."
+      : "- Each clone is this conversation's alone: edit, branch and commit freely.",
+    "- Never work in a clone in `$HOME` or another conversation's workspace: other sessions run "
+    + "at the same time and would edit the same files. If one step truly cannot run twice at "
+    + "once (a shared build directory, a local service), wrap just that step in "
+    + "`flock ~/locks/<name>.lock <command>`.",
+    "",
+  ].join("\n");
+}

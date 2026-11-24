@@ -104,6 +104,21 @@ test("\\watch carries the person's own interval, and needs no skill installed", 
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("\\checkout asks for the repository through checkout_repo", async () => {
+  const root = await skillRoot([]);
+  try {
+    const url = "ssh://git@tec-l-1203160.labs.microstrategy.com:22222/qhu/IServerDev.git";
+    const plain = await expandCommand(`\\checkout ${url}`, root);
+    assert.equal(plain.skill, "\\checkout");
+    assert.match(plain.text, new RegExp(`checkout_repo with url: "${url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`));
+    assert.doesNotMatch(plain.text, /ref:/);
+    const atRef = await expandCommand("\\checkout git@github.com:mstr-kiai/history-list-migrator.git release/26.1\nthen run the tests", root);
+    assert.match(atRef.text, /ref: "release\/26\.1"/);
+    assert.match(atRef.text, /then run the tests/);
+    assert.match((await expandCommand("\\checkout", root)).text, /did not say which/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("\\summarize_skill and \\summarize_knowledge put a conversation away", async () => {
   const root = await skillRoot([]);
   try {

@@ -29,14 +29,19 @@ import { createBashToolDefinition, createEditToolDefinition, createWriteToolDefi
  * `ls` are left alone: seeing the rest of the disk is not what causes the damage.
  */
 
-/** Where a session's workspace, shared `$HOME`, and temporary directory are. */
-export function sandboxPaths(workspace, home) {
+/**
+ * Where a session's workspace, shared `$HOME`, and temporary directory are.
+ *
+ * `git` is `gitCacheSettings()` from git-cache.mjs, or null: with it, `git clone` in
+ * this session goes through the shared mirror.
+ */
+export function sandboxPaths(workspace, home, git = null) {
   const root = resolve(workspace);
-  return { workspace: root, home: resolve(home), tmp: resolve(root, ".tmp") };
+  return { workspace: root, home: resolve(home), tmp: resolve(root, ".tmp"), git };
 }
 
-export async function prepareSandbox(workspace, home) {
-  const paths = sandboxPaths(workspace, home);
+export async function prepareSandbox(workspace, home, git = null) {
+  const paths = sandboxPaths(workspace, home, git);
   // The home outlives the conversation; creating it is idempotent, and a session that
   // runs before anything has ever been installed still needs it to exist.
   await Promise.all([mkdir(paths.home, { recursive: true }), mkdir(paths.tmp, { recursive: true })]);
@@ -101,14 +106,24 @@ function withoutAgentConfig(environment) {
  * `$TMPDIR`, too disposable to want in `~`. Unlike `AI_AGENT_CONFIG_MAPS_FOLDER`, which
  * the image sets once, this one differs per session and exists only inside one.
  */
-export function sandboxEnvironment(environment, { workspace, home, tmp }) {
+export function sandboxEnvironment(environment, { workspace, home, tmp, git = null }) {
   const local = resolve(home, ".local", "bin");
+  // The git wrapper goes in front of everything, ~/.local/bin included: it is the
+  // agent's, not the session's, and a git installed there is not one it should skip.
+  const leading = git ? [git.bin, local] : [local];
   const path = (environment.PATH ?? "").split(":").filter(Boolean);
   return {
     ...withoutAgentConfig(environment),
     AI_AGENT_SESSION_WORKSPACE_DIR: workspace,
+    // `git clone <remote>` through the shared mirror (git-cache.mjs). `AI_AGENT_` is
+    // reserved from config maps, so nothing a skill sets can repoint these.
+    ...(git ? {
+      AI_AGENT_GIT: git.git,
+      AI_AGENT_GIT_CACHE_DIR: resolve(home, ".cache", "zidane", "repos"),
+      AI_AGENT_NODE: git.node,
+    } : {}),
     HOME: home,
-    PATH: [local, ...path.filter((entry) => entry !== local)].join(":"),
+    PATH: [...leading, ...path.filter((entry) => !leading.includes(entry))].join(":"),
     TMPDIR: tmp, TMP: tmp, TEMP: tmp,
     XDG_CACHE_HOME: resolve(home, ".cache"),
     XDG_CONFIG_HOME: resolve(home, ".config"),

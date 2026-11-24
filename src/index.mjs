@@ -18,6 +18,7 @@ import {
   writeSessionToken,
 } from "./config.mjs";
 import { CronScheduler, CronStore } from "./cron.mjs";
+import { gitCacheSettings, mirrorRoot, pruneMirrors } from "./git-cache.mjs";
 import { FollowUpScheduler, FollowUpStore } from "./follow-up.mjs";
 import { DailyJournal } from "./daily.mjs";
 import { KnowledgeStore } from "./knowledge.mjs";
@@ -142,6 +143,16 @@ const digestTimer = digestEnabled
     }, digestEvery * 1_000)
   : null;
 digestTimer?.unref();
+
+// Mirrors nobody has cloned from in two weeks go. Safe whenever it runs: a clone
+// hard-links what it took, so it never needs its mirror again. Off with the cache.
+if (gitCacheSettings()) {
+  const pruneMirrorCache = () => void pruneMirrors(mirrorRoot(local.home))
+    .then((removed) => { if (removed.length) logger.log("info", "removed unused repository mirrors", { count: removed.length }); })
+    .catch((error) => logger.log("warning", "repository mirror cleanup failed", { error: String(error) }));
+  pruneMirrorCache();
+  setInterval(pruneMirrorCache, 24 * 60 * 60_000).unref();
+}
 
 let lastCpu = process.cpuUsage();
 let lastCpuAt = process.hrtime.bigint();

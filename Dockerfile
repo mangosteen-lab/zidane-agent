@@ -59,6 +59,9 @@ WORKDIR /opt/zidane-agent
 COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev
 COPY src ./src
+# The git wrapper sessions find first on PATH (src/git-cache.mjs). Owned by root, so a
+# session — which runs as zidane — cannot replace it for the others.
+COPY bin ./bin
 
 RUN useradd --system --create-home --home-dir /var/lib/zidane-agent zidane \
     && install -d -o zidane -g zidane -m 0700 /var/lib/zidane-agent

@@ -1,10 +1,11 @@
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { MAX_MINUTES, MIN_MINUTES } from "./follow-up.mjs";
+import { checkoutRepository } from "./git-cache.mjs";
 import { readIndex } from "./recall.mjs";
 
 export function contextTools(local, memory, data, session = {}) {
-  const { conversation = "", followUps = null, knowledge = null, react = null } = session;
+  const { conversation = "", followUps = null, knowledge = null, react = null, sandbox = null } = session;
   return [
     // Marking the message being answered, the way a person in a chat room does. Only
     // where there is a delivery to mark: a summary or a scheduled run answers nobody.
@@ -31,6 +32,32 @@ export function contextTools(local, memory, data, session = {}) {
     })] : []),
     // A conversation can ask to be woken later. Only where there is a conversation to
     // wake: a summary or a compaction has nowhere to come back to.
+    // A repository for this conversation, through the shared mirror. Only where there is
+    // a workspace to put it in.
+    ...(sandbox ? [defineTool({
+      name: "checkout_repo",
+      label: "Check out a repository",
+      description:
+        "Clone a git repository into this conversation's workspace and check out a branch, tag or "
+        + "commit. Use it whenever you need a repository's files, instead of running git clone "
+        + "yourself. The download is shared by every session on this agent, so a large repository "
+        + "arrives in seconds after the first time, while the files are this conversation's alone — "
+        + "edit, branch and commit freely; origin is the real repository. Calling it again for the "
+        + "same repository reuses the clone: it fetches and checks out the ref you name. Takes "
+        + "https, http, ssh:// and git@host:path URLs.",
+      parameters: Type.Object({
+        url: Type.String({ minLength: 1, maxLength: 2_000 }),
+        ref: Type.Optional(Type.String({ minLength: 1, maxLength: 300 })),
+        directory: Type.Optional(Type.String({
+          minLength: 1, maxLength: 300,
+          description: "Folder inside the workspace; defaults to the repository's name.",
+        })),
+      }),
+      execute: async (_id, args, signal) => {
+        const result = await checkoutRepository(sandbox, args, { signal });
+        return text(result.message, result.details);
+      },
+    })] : []),
     ...(followUps && conversation ? [defineTool({
       name: "check_back",
       label: "Check back later",

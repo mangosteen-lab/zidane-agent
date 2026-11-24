@@ -130,6 +130,24 @@ export const BUILT_INS = {
       ].join("\n");
     },
   },
+  checkout: {
+    description: "Clone a repository into this conversation, through the shared mirror",
+    usage: "\\checkout <url> [branch, tag or commit]",
+    expand: ({ argument, body }) => {
+      const [url = "", ref = ""] = argument.split(/\s+/).filter(Boolean);
+      return [
+        url
+          ? `The person has asked you to check out ${url}${ref ? ` at ${ref}` : ""}.`
+          : "The person has asked you to check out a repository, but did not say which.",
+        "",
+        url
+          ? `Call checkout_repo with url: ${JSON.stringify(url)}${ref ? ` and ref: ${JSON.stringify(ref)}` : ""}, `
+            + "then say in one line where it is and what is checked out."
+          : "Ask which repository they mean, and stop.",
+        ...(body ? ["", "Then carry on with:", body] : []),
+      ].join("\n");
+    },
+  },
   unwatch: {
     description: "Stop the check-back running on this conversation",
     usage: "\\unwatch",

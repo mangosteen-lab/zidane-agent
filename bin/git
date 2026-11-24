@@ -1,0 +1,39 @@
+#!/bin/sh
+# Zidane's git: the real git, except that `git clone <remote>` goes through the agent's
+# shared mirror (src/git-cache.mjs). Every other command is handed straight over with
+# exec, so the cost of being in front of git is one shell, not one Node start.
+#
+# The agent puts this directory first on every session's PATH and sets AI_AGENT_GIT
+# (the real git), AI_AGENT_GIT_CACHE_DIR (where mirrors live) and AI_AGENT_NODE. Without
+# them — run by hand, or with ZIDANE_AGENT_GIT_CACHE=false — it is plain git.
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+real=${AI_AGENT_GIT:-}
+if [ -z "$real" ] || [ ! -x "$real" ]; then
+  real=
+  saved_ifs=$IFS
+  IFS=:
+  for entry in $PATH; do
+    [ -n "$entry" ] || continue
+    [ "$(CDPATH= cd -- "$entry" 2>/dev/null && pwd)" = "$here" ] && continue
+    if [ -x "$entry/git" ] && [ -f "$entry/git" ]; then real=$entry/git; break; fi
+  done
+  IFS=$saved_ifs
+  if [ -z "$real" ]; then echo "git: not found" >&2; exit 127; fi
+fi
+
+if [ -n "${AI_AGENT_GIT_CACHE_DIR:-}" ]; then
+  # The subcommand is the first word that is neither an option nor the value of -C / -c.
+  skip=
+  for arg in "$@"; do
+    if [ -n "$skip" ]; then skip=; continue; fi
+    case $arg in
+      -C|-c) skip=1 ;;
+      -*) ;;
+      clone)
+        AI_AGENT_GIT=$real exec "${AI_AGENT_NODE:-node}" "$here/../src/git-cache.mjs" "$@" ;;
+      *) break ;;
+    esac
+  done
+fi
+exec "$real" "$@"

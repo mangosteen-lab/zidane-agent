@@ -18,6 +18,7 @@ back. Capacity controls how many Pi sessions may run concurrently.
 | `ZIDANE_AGENT_CAPACITY` | `1` | Maximum concurrent Pi sessions |
 | `ZIDANE_AGENT_WORKING_DIRECTORY` | `/var/lib/zidane-agent` | Durable local state root |
 | `ZIDANE_AGENT_ALLOW_INSECURE_WS` | unset | Permit remote plain WebSocket only on a trusted network |
+| `ZIDANE_AGENT_GIT_CACHE` | `true` | `false` removes the shared repository mirror; `git clone` is then plain git |
 
 The bootstrap key is exchanged for a rotating, one-use session credential. The rotated
 credential is stored mode `0600`; the bootstrap key is never written to agent metadata.
@@ -119,6 +120,27 @@ no longer shared with this agent. Account skills import the same way and record 
 origin in the skill's `.zidane.json`, so a sync can refresh or remove exactly those
 copies; a `SKILL.md` placed in `skills/` by hand is never touched. Secret values are
 never returned by the agent.
+
+## Cloning big repositories
+
+Every session can run at the same time as the others in its own workspace, so a large
+repository is not shared as one working folder. The *download* is shared instead:
+
+- `git clone <url>` in any session goes through a wrapper (`bin/git`) that keeps one bare
+  mirror per repository in `~/.cache/zidane/repos/<host>/<path>.git` and clones from it.
+  The first clone downloads the history once; later ones take seconds, and git
+  hard-links the object files, so a clone costs almost no extra disk.
+- The clone is an ordinary, independent repository: `origin` is the URL you gave, and it
+  is fetched straight away with that URL's own credentials, so you get the newest commits
+  and a URL you cannot reach fails exactly as plain git would.
+- `https://`, `http://`, `ssh://host:port/…` and `git@host:path` all work; two spellings
+  of one repository share a mirror. Shallow, bare, `--reference`, `--filter` and
+  local-path clones are passed to git unchanged, and so is every other git command.
+- The `checkout_repo` tool and the `\checkout <url> [ref]` command do the same, check out
+  a branch, tag or commit, and reuse the conversation's clone when called again.
+- Mirrors nobody cloned from for 14 days are removed. If one step really cannot run
+  twice at once (a shared build directory, a local service), wrap only that step in
+  `flock ~/locks/<name>.lock <command>`.
 
 ## Checking back on something slow
 

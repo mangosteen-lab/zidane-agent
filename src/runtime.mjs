@@ -5,8 +5,9 @@ import { discoverSkills } from "./agent-data.mjs";
 import { expandCommand, looksLikeCommand } from "./commands.mjs";
 import { readSecretValue, resolveLlmProfile } from "./config.mjs";
 import { contextTools } from "./context-tools.mjs";
-import { recallExtension, recallGuidance } from "./recall.mjs";
+import { recallExtension, recallGuidance, repositoryGuidance } from "./recall.mjs";
 import { describeFailure } from "./prompt-failure.mjs";
+import { gitCacheSettings } from "./git-cache.mjs";
 import { prepareSandbox, sandboxTools } from "./sandbox.mjs";
 
 const COMPACT_PROMPT = `Summarise this entire conversation as a durable note for your future self.
@@ -14,7 +15,7 @@ Capture the decisions reached, the constraints discovered, and anything you woul
 resume this work later. Leave out pleasantries and anything already obvious. Write prose,
 no more than 300 words, and include no credentials or secret values.`;
 
-const DEFAULT_TOOLS = ["read", "grep", "find", "ls", "write", "edit", "bash", "remember", "retrieve_memory", "forget_memory", "search_knowledge", "draft_skill", "draft_knowledge", "check_back", "stop_checking", "react"];
+const DEFAULT_TOOLS = ["read", "grep", "find", "ls", "write", "edit", "bash", "remember", "retrieve_memory", "forget_memory", "search_knowledge", "draft_skill", "draft_knowledge", "check_back", "stop_checking", "react", "checkout_repo"];
 
 /** Why a prompt was refused, so the control plane can decide whether to queue it. */
 export class BusyError extends Error {
@@ -209,7 +210,10 @@ export class PiRuntime {
     // $TMPDIR points inside the workspace, so scratch dies with the conversation instead
     // of piling up in the container. $HOME is the agent's shared session home, which is
     // what lets a tool installed or configured once still be there next time.
-    const sandbox = await prepareSandbox(workspace, this.local.home);
+    // `gitCache` is resolved once per process: which git is real does not change, and
+    // `ZIDANE_AGENT_GIT_CACHE=false` is read from the agent's own environment.
+    this.gitCache ??= gitCacheSettings();
+    const sandbox = await prepareSandbox(workspace, this.local.home, this.gitCache || null);
     const runtime = await ModelRuntime.create({ authPath: resolve(this.local.auth, "pi-auth.json"), modelsPath: resolve(this.local.config, "models.json") });
     if (profile.provider && profile.secret_value) {
       await runtime.setRuntimeApiKey(profile.provider, readSecretValue(profile.secret_value));
@@ -219,7 +223,7 @@ export class PiRuntime {
     const loader = new DefaultResourceLoader({
       cwd: workspace,
       agentDir: this.local.root,
-      systemPromptOverride: () => (recall ? `${soul.trimEnd()}\n\n${recallGuidance(tools)}\n` : soul),
+      systemPromptOverride: () => (recall ? `${soul.trimEnd()}\n\n${recallGuidance(tools)}\n${repositoryGuidance(tools, Boolean(sandbox.git))}` : soul),
       additionalSkillPaths: skillPaths,
       extensionFactories: recall ? [recallExtension({ memory: this.memory, local: this.local, logger: this.logger })] : [],
     });
@@ -242,6 +246,7 @@ export class PiRuntime {
         // and nothing else: a session can only ask to be brought back to where it is.
         ...contextTools(this.local, this.memory, this.data, {
           conversation,
+          sandbox,
           followUps: this.followUps,
           knowledge: this.knowledge,
           // A session can only mark the message it was given: the delivery is the
