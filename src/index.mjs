@@ -223,11 +223,12 @@ async function handleMessage(message) {
       await writeSessionToken(local, message.session_token);
     }
     logger.log("info", "agent registered", { agent_id: agentId });
-    // A task that finished while the socket was down still reports itself, in order.
-    if (cron.pending) {
-      logger.log("info", "delivering scheduled-task reports held over the reconnect", { pending: cron.pending });
-      cron.flush();
-    }
+    // A task whose report the control plane never acknowledged — the socket was down,
+    // or went down under the frame — reports itself again, in order. Kept on disk, so
+    // this also covers a restart.
+    void cron.flush().then((sent) => {
+      if (sent) logger.log("info", "re-sent scheduled-task reports not yet acknowledged", { pending: sent });
+    }).catch((error) => logger.log("warning", "scheduled-task reports could not be re-sent", { error: String(error) }));
     // A reconnect is when an agent is most likely to be out of date: something may have
     // changed while it was down, and nothing queued that for it.
     if (syncEnabled()) accountSync.request("reconnect");
@@ -242,6 +243,10 @@ async function handleMessage(message) {
       await clearSessionToken(local);
       socket.close();
     }
+    return;
+  }
+  if (message.type === "TASK_REPORT_ACK") {
+    await cron.acknowledge(message.conversation_id);
     return;
   }
   if (message.type === "PING") {

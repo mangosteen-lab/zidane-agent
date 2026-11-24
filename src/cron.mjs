@@ -177,14 +177,69 @@ export class CronStore {
    * replaces so the caller can reclaim it. Serialised with everything else that touches
    * history: two runs of one task must never both believe they own the pointer.
    */
-  setSession(taskId, conversation) {
+  setSession(taskId, conversation, prompt = "") {
     return this.#serial(async () => {
       const history = await this.#readHistory();
       const id = String(taskId);
       const previous = history[id]?.session ?? null;
-      history[id] = { ...(history[id] ?? {}), session: conversation ? String(conversation) : null };
+      history[id] = {
+        ...(history[id] ?? {}),
+        session: conversation ? String(conversation) : null,
+        prompt: String(prompt ?? ""),
+      };
       await this.#writeHistory(history);
       return previous;
+    });
+  }
+
+  /**
+   * The newest run of every task whose report the control plane has not acknowledged.
+   *
+   * This is the outbox, and it is the history file rather than memory: a report handed
+   * to a socket that was already being torn down is lost on the wire, and one held only
+   * in memory is lost with a restart. Either way the person is left with a "Resume last
+   * run" that names a thread nobody recorded. Built from what history already keeps —
+   * only the newest run of a task has a session, so only it can need announcing — and
+   * a record from before acknowledgements existed is simply announced once more, which
+   * the control plane answers idempotently by conversation id.
+   */
+  unreported() {
+    return this.#serial(async () => {
+      const [tasks, history] = await Promise.all([this.#readTasks(), this.#readHistory()]);
+      const reports = [];
+      for (const task of tasks) {
+        const record = history[task.id];
+        if (!record?.session || record.reported === record.session) continue;
+        const entry = [record.success, record.failure]
+          .filter(Boolean)
+          .sort((a, b) => (b.finished_at ?? 0) - (a.finished_at ?? 0))[0];
+        if (!entry) continue;
+        reports.push({
+          task_id: task.id,
+          name: task.name,
+          conversation_id: record.session,
+          status: entry.status === "success" ? "success" : "error",
+          started_at: entry.started_at ?? null,
+          finished_at: entry.finished_at ?? null,
+          duration_ms: entry.duration_ms ?? null,
+          prompt: record.prompt || taskPrompt(task),
+          output: entry.output ?? "",
+          error: entry.error ?? "",
+        });
+      }
+      return reports.sort((a, b) => (a.finished_at ?? 0) - (b.finished_at ?? 0));
+    });
+  }
+
+  /** The control plane holds the thread for this conversation: stop announcing it. */
+  markReported(conversation) {
+    return this.#serial(async () => {
+      const history = await this.#readHistory();
+      const id = Object.keys(history).find((key) => history[key]?.session === String(conversation ?? ""));
+      if (!id) return false;
+      history[id] = { ...history[id], reported: history[id].session };
+      await this.#writeHistory(history);
+      return true;
     });
   }
 
@@ -354,9 +409,6 @@ export class CronScheduler {
   // faster than it runs must not stack up copies of itself.
   #queue = [];
   #timer = null;
-  // Reports the socket would not take. Held in memory only: a report is worth a
-  // reconnect, not a restart — the run itself is already in history either way.
-  #outbox = [];
 
   constructor(store, runtime, logger, options = {}) {
     this.store = store;
@@ -366,7 +418,6 @@ export class CronScheduler {
     this.limit = Math.max(1, Number(options.limit) || 3);
     this.queueLimit = Math.max(1, Number(options.queueLimit) || 100);
     this.intervalMs = Math.max(5_000, Number(options.intervalMs) || 30_000);
-    this.outboxLimit = Math.max(1, Number(options.outboxLimit) || 50);
   }
 
   get active() { return this.#running.size; }
@@ -527,7 +578,7 @@ export class CronScheduler {
     } finally {
       this.#progress.delete(task.id);
     }
-    await this.#handOver(task, conversation, prompt, entry);
+    await this.#handOver(task, conversation, prompt);
     return entry;
   }
 
@@ -538,20 +589,9 @@ export class CronScheduler {
    * so a crash in between leaves a thread whose session is intact rather than a session
    * nobody can reach.
    */
-  async #handOver(task, conversation, prompt, entry) {
-    const previous = await this.store.setSession(task.id, conversation);
-    this.#send({
-      task_id: task.id,
-      name: task.name,
-      conversation_id: conversation,
-      status: entry?.status === "success" ? "success" : "error",
-      started_at: entry?.started_at ?? null,
-      finished_at: entry?.finished_at ?? null,
-      duration_ms: entry?.duration_ms ?? null,
-      prompt,
-      output: entry?.output ?? "",
-      error: entry?.error ?? "",
-    });
+  async #handOver(task, conversation, prompt) {
+    const previous = await this.store.setSession(task.id, conversation, prompt);
+    await this.flush();
     if (!previous || previous === conversation) return;
     await this.#reclaim(previous, `This scheduled run of “${task.name}” was superseded by a newer one, and its session was reclaimed. Only the latest run of a task keeps a live session.`);
   }
@@ -593,27 +633,28 @@ export class CronScheduler {
     }
   }
 
-  /** Queue a report and try to deliver it, oldest first. */
-  #send(report) {
-    this.#outbox.push(report);
-    while (this.#outbox.length > this.outboxLimit) this.#outbox.shift();
-    this.flush();
-  }
-
   /**
-   * Deliver whatever the socket would not take earlier.
+   * Announce every report the control plane has not acknowledged, oldest first.
    *
-   * Called again on every registration: a task that finished during a reconnect still
-   * reaches the person it was run for, in the order the runs happened.
+   * Called after each run and again on every registration. Sending is not delivering —
+   * a frame can reach a socket the server is already closing — so nothing is crossed
+   * off here; `acknowledge` does that when `TASK_REPORT_ACK` comes back. Resolves to the
+   * number sent, or false when the socket would not take one.
    */
-  flush() {
-    while (this.#outbox.length) {
-      if (this.emit("TASK_REPORT", this.#outbox[0]) === false) return false;
-      this.#outbox.shift();
+  async flush() {
+    let sent = 0;
+    for (const report of await this.store.unreported()) {
+      if (this.emit("TASK_REPORT", report) === false) return false;
+      sent += 1;
     }
-    return true;
+    return sent;
   }
 
-  /** Reports still waiting for a socket. */
-  get pending() { return this.#outbox.length; }
+  /** `TASK_REPORT_ACK`: the thread for this run exists, so it need not be sent again. */
+  acknowledge(conversation) {
+    return this.store.markReported(conversation);
+  }
+
+  /** Reports the control plane has not acknowledged yet. */
+  async pending() { return (await this.store.unreported()).length; }
 }

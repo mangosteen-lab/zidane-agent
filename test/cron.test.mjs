@@ -378,17 +378,73 @@ test("a failed run reports itself too, and a report the socket refuses waits for
     await idle(scheduler);
     // Refused by a closed socket: the run is in history, and the report waits.
     assert.deepEqual(frames, []);
-    assert.equal(scheduler.pending, 1);
+    assert.equal(await scheduler.pending(), 1);
     assert.match((await store.get(task.id)).last_failure.error, /the registry timed out/);
 
     connected = true;
-    assert.equal(scheduler.flush(), true);
-    assert.equal(scheduler.pending, 0);
+    assert.equal(await scheduler.flush(), 1);
     const [[type, report]] = frames;
     assert.equal(type, "TASK_REPORT");
     assert.equal(report.status, "error");
     assert.match(report.error, /the registry timed out/);
     assert.equal(report.output, "");
+    // Sent is not delivered: until the control plane acknowledges it, it is still owed.
+    assert.equal(await scheduler.pending(), 1);
+    assert.equal(await scheduler.acknowledge(report.conversation_id), true);
+    assert.equal(await scheduler.pending(), 0);
+    assert.equal(await scheduler.flush(), 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a report sent to a closing socket is re-sent on the next registration, even after a restart", async () => {
+  const root = await mkdtemp(resolve(tmpdir(), "zidane-cron-ack-test-"));
+  try {
+    const local = { crontab: resolve(root, "crontab") };
+    const frames = [];
+    const emit = (type, fields) => { frames.push([type, fields]); return true; };
+    const runtime = { runTask: () => Promise.resolve("upgraded elasticsearch"), discard: () => Promise.resolve() };
+    const scheduler = new CronScheduler(new CronStore(local), runtime, null, { limit: 1, emit });
+    const task = await scheduler.store.create({ name: "Regular fix the CVE", description: "scan", schedule: "0 22 * * *", skills: [] });
+
+    await scheduler.tick(Date.parse("2026-11-23T22:00:00Z"));
+    await idle(scheduler);
+    // The socket took the frame, and the server dropped it: no acknowledgement came back.
+    assert.equal(frames.length, 1);
+    const [, sent] = frames[0];
+
+    // A fresh process over the same working directory still owes the report, word for word.
+    frames.length = 0;
+    const restarted = new CronScheduler(new CronStore(local), runtime, null, { limit: 1, emit });
+    assert.equal(await restarted.flush(), 1);
+    assert.deepEqual(frames[0][1], sent);
+    assert.equal(frames[0][1].task_id, task.id);
+    assert.match(frames[0][1].prompt, /scan/);
+
+    await restarted.acknowledge(sent.conversation_id);
+    frames.length = 0;
+    assert.equal(await restarted.flush(), 0);
+    assert.deepEqual(frames, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a session recorded before acknowledgements existed is announced once more", async () => {
+  const root = await mkdtemp(resolve(tmpdir(), "zidane-cron-legacy-test-"));
+  try {
+    const store = new CronStore({ crontab: resolve(root, "crontab") });
+    const task = await store.create({ name: "Legacy", description: "old run", schedule: "0 2 * * *", skills: [] });
+    await store.record(task.id, { started_at: 1, finished_at: 2, status: "success", output: "done" });
+    // What an older agent wrote: a session pointer, no prompt and no acknowledgement.
+    await store.setSession(task.id, "cron-legacy-1");
+    const [report] = await store.unreported();
+    assert.equal(report.conversation_id, "cron-legacy-1");
+    assert.equal(report.output, "done");
+    assert.match(report.prompt, /old run/);
+    assert.equal(await store.markReported("cron-legacy-1"), true);
+    assert.deepEqual(await store.unreported(), []);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
