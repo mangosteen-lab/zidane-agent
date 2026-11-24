@@ -254,6 +254,16 @@ async function handleMessage(message) {
       await clearSessionToken(local);
       socket.close();
     }
+    if (message.code === "agent.removed") {
+      // Removed from its account in the console. Reconnecting would only be refused
+      // again, and exiting would have a container restart policy start it straight back
+      // up to be refused, so it stops talking to the server and stays idle: the operator
+      // uninstalls it, or registers it again with a new key.
+      logger.log("critical", "this agent was removed from its account and will not reconnect; uninstall it, or reinstall it with a new registration key", {});
+      await clearSessionToken(local);
+      shutdown("removed");
+      setInterval(() => {}, 2 ** 30);
+    }
     return;
   }
   if (message.type === "TASK_REPORT_ACK") {
@@ -512,6 +522,9 @@ function reconnect() {
 }
 
 async function connect() {
+  // A reconnect can be scheduled by the close before the message that stopped the agent
+  // has been handled; it must not open a connection the agent no longer wants.
+  if (stopped) return;
   socket = new WebSocket(config.serverUrl, { maxPayload: 2 * 1024 * 1024 });
   socket.on("open", async () => {
     const sessionToken = await readSessionToken(local);
